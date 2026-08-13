@@ -125,6 +125,7 @@ body {
 .tag.out { background: rgba(124, 92, 255, 0.18); color: #b3a4ff; }
 
 .row { display: flex; justify-content: space-between; align-items: center; font-size: 0.92rem; }
+.row-actions { display: flex; gap: 8px; }
 .muted { color: var(--muted); }
 
 .meter { height: 8px; background: var(--border); border-radius: 999px; overflow: hidden; }

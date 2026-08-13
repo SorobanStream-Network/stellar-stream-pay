@@ -48,8 +48,9 @@ async function readStream(streamId) {
   try {
     const res = await rpc.getContractData(STREAM_CONTRACT_ID, streamKey(streamId), "persistent");
     // `getContractData` returns a LedgerEntryResult whose `.val` is a
-    // LedgerEntryData; for contract data the ScVal lives at `.val.value.val`.
-    const scv = res.val?.value?.val;
+    // LedgerEntryData union. `.value()` unwraps it to the ContractDataEntry,
+    // whose `.val()` is the stored ScVal.
+    const scv = res.val?.value()?.val();
     if (!scv) return null;
     const native = scValToNative(scv);
     return native ?? null; // scvVoid -> null means "no value"
@@ -62,7 +63,7 @@ async function readStream(streamId) {
 async function readStreamCount() {
   try {
     const res = await rpc.getContractData(STREAM_CONTRACT_ID, COUNTER_KEY, "persistent");
-    const scv = res.val?.value?.val;
+    const scv = res.val?.value()?.val();
     if (!scv) return 0;
     return Number(scValToNative(scv)); // u64 -> BigInt -> number
   } catch {
@@ -82,11 +83,25 @@ function vestedAmount(total, start, end, now) {
 
 /** Decorate a raw stream with computed accrual/withdrawable/progress. */
 function enrich(raw, id, now) {
-  const accrued = vestedAmount(raw.total_amount, raw.start_time, raw.end_time, now);
-  const withdrawable = raw.cancelled ? 0n : accrued - raw.withdrawn;
+  // A cancelled stream freezes vesting at `cancelled_at`; an active one tracks
+  // the ledger clock. This mirrors the contract's `vested_so_far`.
+  const effectiveNow = raw.cancelled ? raw.cancelled_at : now;
+  const accrued = vestedAmount(
+    raw.total_amount,
+    raw.start_time,
+    raw.end_time,
+    effectiveNow,
+  );
+  // After cancellation the receiver may still withdraw the portion that vested
+  // before the freeze, so withdrawable is always accrued minus what was pulled.
+  const withdrawable = accrued - raw.withdrawn;
   const duration = raw.end_time - raw.start_time;
   const elapsed =
-    now <= raw.start_time ? 0n : now < raw.end_time ? now - raw.start_time : duration;
+    effectiveNow <= raw.start_time
+      ? 0n
+      : effectiveNow < raw.end_time
+        ? effectiveNow - raw.start_time
+        : duration;
   const progress = duration === 0n ? 1 : Number(elapsed) / Number(duration);
 
   return {

@@ -105,6 +105,37 @@ export async function withdrawStream(
 }
 
 /**
+ * Invoke `cancel_stream(stream_id)` on behalf of the connected sender.
+ * Refunds the unvested remainder to the sender; any already-vested amount
+ * stays locked in the contract and remains withdrawable by the receiver.
+ */
+export async function cancelStream(
+  sender: string,
+  streamId: number,
+): Promise<string> {
+  if (!CONFIG.contractId) throw new WalletError("VITE_CONTRACT_ID is not set.");
+  const server = rpcServer();
+  const sourceAccount = await server.getAccount(sender);
+  const contract = new Contract(CONFIG.contractId);
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase: CONFIG.networkPassphrase,
+  })
+    .addOperation(
+      contract.call(
+        "cancel_stream",
+        new Address(sender).toScVal(),
+        nativeToScVal(streamId, { type: "u64" }),
+      ),
+    )
+    .setTimeout(30)
+    .build();
+
+  return signAndSubmit(server, tx);
+}
+
+/**
  * Invoke `create_stream(...)` on behalf of the connected sender. `amount` is
  * a decimal string of the token's *base units* (e.g. stroops for XLM/SAC).
  */

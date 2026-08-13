@@ -1,6 +1,11 @@
 import { useCallback, useState, type FormEvent } from "react";
 import { CONFIG } from "./config";
-import { createStream, connectWallet, withdrawStream } from "./lib/soroban";
+import {
+  cancelStream,
+  createStream,
+  connectWallet,
+  withdrawStream,
+} from "./lib/soroban";
 
 /** Shape returned by the backend `/api/stream/:address` endpoint. */
 type Stream = {
@@ -35,6 +40,7 @@ export default function App() {
   const [streams, setStreams] = useState<Stream[]>([]);
   const [loadingStreams, setLoadingStreams] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [cancellingId, setCancellingId] = useState<number | null>(null);
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const [error, setError] = useState<string | null>(null);
@@ -81,6 +87,22 @@ export default function App() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const handleCancel = async (s: Stream) => {
+    if (!walletAddress) return;
+    setCancellingId(s.id);
+    setError(null);
+    setNotice(null);
+    try {
+      const hash = await cancelStream(walletAddress, s.id);
+      setNotice(`Stream cancelled: ${hash.slice(0, 14)}…`);
+      await loadStreams(walletAddress);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCancellingId(null);
     }
   };
 
@@ -202,10 +224,14 @@ export default function App() {
               <ul className="streams">
                 {streams.map((s) => {
                   const outgoing = s.sender === walletAddress;
+                  // A cancelled stream is still claimable by the receiver for
+                  // the portion that vested before cancellation.
                   const canWithdraw =
-                    !s.cancelled &&
                     s.receiver === walletAddress &&
                     BigInt(s.withdrawable) > 0n;
+                  // Senders may cancel an active stream and reclaim the
+                  // unvested remainder.
+                  const canCancel = s.sender === walletAddress && !s.cancelled;
                   return (
                     <li key={s.id} className={`card ${s.cancelled ? "cancelled" : ""}`}>
                       <div className="card-head">
@@ -239,15 +265,26 @@ export default function App() {
                             ? "Cancelled"
                             : `${Math.round(s.progress * 100)}% vested`}
                         </span>
-                        {canWithdraw && (
-                          <button
-                            className="btn primary small"
-                            onClick={() => handleWithdraw(s)}
-                            disabled={busyId === s.id}
-                          >
-                            {busyId === s.id ? "Withdrawing…" : "Withdraw"}
-                          </button>
-                        )}
+                        <span className="row-actions">
+                          {canWithdraw && (
+                            <button
+                              className="btn primary small"
+                              onClick={() => handleWithdraw(s)}
+                              disabled={busyId === s.id}
+                            >
+                              {busyId === s.id ? "Withdrawing…" : "Withdraw"}
+                            </button>
+                          )}
+                          {canCancel && (
+                            <button
+                              className="btn secondary small"
+                              onClick={() => handleCancel(s)}
+                              disabled={cancellingId === s.id}
+                            >
+                              {cancellingId === s.id ? "Cancelling…" : "Cancel"}
+                            </button>
+                          )}
+                        </span>
                       </div>
                     </li>
                   );
