@@ -1,0 +1,45 @@
+name: Rust / Soroban
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contract:
+    name: Contract — test & build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Soroban contracts build for the `wasm32v1-none` target — the only
+          # Wasm target supported by the Soroban runtime (Rust 1.84+). This is
+          # *not* the generic `wasm32-unknown-unknown` target used by other
+          # Rust/Wasm projects; using that target would not produce a runnable
+          # Soroban contract.
+          targets: wasm32v1-none
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+
+      - name: Check (host target)
+        run: cargo check
+
+      - name: Test
+        run: cargo test
+
+      - name: Build (Soroban Wasm target)
+        run: cargo build --target wasm32v1-none --release

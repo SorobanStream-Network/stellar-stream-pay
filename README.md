@@ -1,48 +1,121 @@
-# StellarStream-Pay
+<div align="center">
 
-Multi-tier cross-border payroll and continuous streaming payment infrastructure
-built on [Stellar](https://stellar.org) / [Soroban](https://developers.stellar.org/docs/smart-contracts).
+# 💸 StellarStream-Pay
 
-A **stream** is a linearly-vesting payment: a sender locks a token amount for a
-fixed duration, and the receiver can withdraw the pro-rata amount that has
-accrued so far — on demand, at any time. Streams can be denominated in any
-SEP-41 token, including Stellar Asset Contract (SAC) wrapped native assets
-(XLM, USDC, EURC, …).
+**Continuous, linearly-vesting streaming payments on [Stellar](https://stellar.org) / [Soroban](https://developers.stellar.org/docs/smart-contracts).**
 
-```
-accrued(t) = total × min(t, end) − start
-                    ─────────────────────
-                         end − start
-```
+*Stream salaries, grants, and unlocks token-by-token, in real time — on-chain,
+self-custodial, and denominated in any SEP-41 asset (including SAC-wrapped XLM,
+USDC, EURC, …).*
+
+![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
+![Soroban SDK](https://img.shields.io/badge/soroban--sdk-27.0.6-7c5cff)
+![Rust](https://img.shields.io/badge/rust-1.84%2B-orange.svg)
+![Network](https://img.shields.io/badge/network-testnet-3bd0c9)
+
+</div>
 
 ---
 
-## Repository layout
+## What is a "stream"?
 
+A **stream** is a time-release payment. A sender locks a token amount for a fixed
+duration, and the receiver can withdraw the pro-rata amount that has accrued so
+far — on demand, at any time, without further involvement from the sender.
+
+```text
+                  min(t, end) − start
+   accrued(t) = total × ─────────────────
+                        end − start
+
+   withdrawable(t) = accrued(t) − withdrawn
 ```
-stellar-stream-pay/
-├── contracts/          # Rust / Soroban smart contract
-│   ├── src/lib.rs      #   create_stream, withdraw, cancel_stream + views
-│   └── Cargo.toml
-├── backend/            # Node.js / Express indexer & API
-│   └── src/index.js    #   reads stream state from Soroban RPC + Horizon
-├── frontend/           # React / Vite DApp with Freighter wallet
-│   └── src/App.tsx     #   dashboard: view/manage streams, trigger withdrawals
-└── README.md
+
+- **Sender** → `create_stream(...)` locks funds in the vault and starts the clock.
+- **Receiver** → `withdraw(...)` pulls the accrued, un-withdrawn amount at any time.
+- **Sender** → `cancel_stream(...)` stops vesting and refunds the unvested remainder
+  (the already-vested portion stays claimable by the receiver).
+
+Every mutating call enforces `require_auth()` on the acting party, and all token
+movement flows through the standard [SEP-41](https://developers.stellar.org/docs/tokens/token-interface)
+`token::Client` interface — so streams work identically for Stellar Asset
+Contracts (SAC) and custom tokens.
+
+## Architecture
+
+```text
+                          ┌─────────────────────────────┐
+                          │       Employer (sender)     │
+                          │     Freighter wallet (G…)   │
+                          └──────────────┬──────────────┘
+                                         │  create_stream(token, amount, duration)
+                                         │  require_auth(sender) · locks tokens
+                                         ▼
+                          ┌─────────────────────────────┐
+                          │        Soroban Vault        │
+                          │    StreamingContract (C…)   │
+                          │                             │
+                          │  stream = {                 │
+                          │    sender, receiver, token, │
+                          │    total, start, end,       │
+                          │    withdrawn, cancelled     │
+                          │  }                          │
+                          └───────┬──────────────┬──────┘
+                                  │              │
+        withdraw(accrued)         │              │  cancel_stream(refund)
+        require_auth(receiver)    │              │  require_auth(sender)
+                                  ▼              ▼
+               ┌────────────────────────┐   ┌────────────────────────┐
+               │    Receiver (payee)    │   │   Employer (refund)    │
+               │  withdraws on demand   │   │  unvested remainder    │
+               └────────────────────────┘   └────────────────────────┘
+
+                    ── roadmap (not yet implemented) ──
+   Employer ─► Vault ─► Payer ─► Split / Dependency streams ─► Sub-payees
 ```
 
 ### How the pieces fit together
 
-- **Contract** — holds locked funds and enforces the linear vesting schedule.
-  Emits `created`, `withdrawn`, and `cancelled` events for indexers.
-- **Backend** — Express API that reads contract storage directly via Soroban
-  RPC (`getContractData`) and classic balances via Horizon. Serves the
-  frontend with decorated stream data (accrued / withdrawable / progress).
-- **Frontend** — Freighter wallet integration; builds, simulates, assembles,
-  signs, and submits `withdraw` / `create_stream` transactions with
-  `@stellar/stellar-sdk`.
+- **Contract** (`contracts/`) — holds locked funds and enforces the linear vesting
+  schedule. Emits `created`, `withdrawn`, and `cancelled` events for indexers.
+- **Backend** (`backend/`) — Express API that reads contract storage directly via
+  Soroban RPC (`getContractData`) and classic balances via Horizon, serving the
+  frontend with decorated stream data (`accrued`, `withdrawable`, `progress`).
+- **Frontend** (`frontend/`) — Freighter wallet integration; builds, simulates,
+  assembles, signs, and submits `create_stream` / `withdraw` / `cancel_stream`
+  transactions with `@stellar/stellar-sdk`.
 
----
+## Features
+
+- 🔐 **Soroban smart contract** — `#![no_std]`, strict `require_auth()` on every
+  actor, check-effects-interactions ordering, overflow-checked arithmetic, and a
+  complete unit/integration test suite with authorization-tree assertions.
+- ⛓️ **SAC & SEP-41 native** — streams any token through the standard token
+  interface; no separate mint/clawback/admin logic.
+- 🗂️ **Node indexer / API** — reads live stream state from Soroban RPC and account
+  balances from Horizon, with computed accrual/withdrawable/progress.
+- ⚛️ **React + Freighter DApp** — connect wallet, create streams, withdraw accrued
+  amounts, and cancel streams from a clean dashboard.
+- 📡 **Lifecycle events** — `created` / `withdrawn` / `cancelled` topics for
+  event-based indexing and notifications.
+
+## Repository layout
+
+```text
+stellar-stream-pay/
+├── contracts/              # Rust / Soroban smart contract
+│   ├── src/lib.rs          #   create_stream, withdraw, cancel_stream + views
+│   ├── Cargo.toml          #   soroban-sdk, cdylib crate, release profile
+│   └── test_snapshots/     #   committed SDK snapshot tests
+├── backend/                # Node.js / Express indexer & API
+│   └── src/index.js        #   reads stream state from Soroban RPC + Horizon
+├── frontend/               # React / Vite DApp with Freighter wallet
+│   ├── src/App.tsx         #   dashboard: view/manage streams, trigger actions
+│   └── src/lib/soroban.ts  #   wallet + transaction helpers
+├── .github/workflows/      # CI (cargo check + test + Soroban Wasm build)
+├── SECURITY.md             # vulnerability disclosure policy
+└── README.md
+```
 
 ## Prerequisites
 
@@ -67,20 +140,22 @@ stellar --version
 node --version       # >= 20
 ```
 
----
+## Quick start
 
-## 1. Build & deploy the contract
+### 1. Build, test & deploy the contract
 
 ```bash
 cd contracts
+
+# Compile to target/wasm32v1-none/release/stellar_stream_pay.wasm.
+# Always use `stellar contract build` (never plain `cargo build`).
 stellar contract build
+
+# Run the vesting-math + integration + auth-tree unit tests.
+cargo test
 ```
 
-This compiles `src/lib.rs` to
-`target/wasm32v1-none/release/stellar_stream_pay.wasm`.
-(Always use `stellar contract build` — never `cargo build`.)
-
-Upload (install) the Wasm, then deploy an instance:
+Upload (install) the Wasm, then deploy an instance on Testnet:
 
 ```bash
 # Install the compiled Wasm; prints a hex wasm hash.
@@ -94,25 +169,18 @@ stellar contract deploy \
   --network testnet
 ```
 
-Copy the contract id — you'll need it for the backend and frontend.
+Copy the contract id — the backend and frontend both need it.
 
-> **Run the unit tests** for the vesting math with:
-> ```bash
-> cd contracts && cargo test
-> ```
-
----
-
-## 2. Run the backend
+### 2. Run the backend
 
 ```bash
 cd backend
-cp .env.example .env        # then set STREAM_CONTRACT_ID to your contract id
+cp .env.example .env          # set STREAM_CONTRACT_ID to your contract id
 npm install
-npm start                   # or: npm run dev (watch mode)
+npm start                     # or: npm run dev (watch mode)
 ```
 
-The server listens on `http://localhost:4000` and exposes:
+The server listens on `http://localhost:4000`:
 
 | Endpoint | Description |
 |----------|-------------|
@@ -120,33 +188,26 @@ The server listens on `http://localhost:4000` and exposes:
 | `GET /api/stream/:address` | Streams where `:address` is sender or receiver (Soroban RPC) |
 | `GET /api/account/:address` | Classic/SAC balances for an address (Horizon) |
 
-Example:
-
 ```bash
 curl http://localhost:4000/api/stream/GBVZ...YOUR...ADDRESS
 ```
 
----
-
-## 3. Run the frontend
+### 3. Run the frontend
 
 ```bash
 cd frontend
-cp .env.example .env       # set VITE_CONTRACT_ID to your contract id
+cp .env.example .env          # set VITE_CONTRACT_ID to your contract id
 npm install
-npm run dev                # http://localhost:5173
+npm run dev                   # http://localhost:5173
 ```
 
-Make sure the backend is running (the dashboard reads streams from
-`VITE_BACKEND_URL`). Then:
+With the backend running (`VITE_BACKEND_URL`):
 
 1. Click **Connect Freighter**.
-2. **Create a stream** by entering a receiver, the SAC/token contract id, the
-   amount in base units, and a duration in seconds.
-3. Any stream where you are the receiver shows a **Withdraw** button once
-   something has vested.
-
----
+2. **Create a stream** — enter a receiver, the SAC/token contract id, the amount
+   in base units, and a duration in seconds.
+3. Streams where you are the receiver show a **Withdraw** button once something
+   has vested; streams you sent show a **Cancel** button.
 
 ## Contract API
 
@@ -167,27 +228,24 @@ Make sure the backend is running (the dashboard reads streams from
 
 The backend reads both directly via RPC `getContractData`.
 
----
+## Security
 
-## Security notes
-
-- **Authorization** — `create_stream`, `withdraw`, and `cancel_stream` each
-  call `require_auth()` on the acting party; token pulls/pushes flow through
-  the SEP-41 `token::Client`, which enforces its own auth.
-- **Check-effects-interactions** — stream state is updated *before* external
-  token calls, and arithmetic overflow traps (rather than wraps) thanks to
-  `overflow-checks = true` in the release profile.
-- **SAC compatibility** — transfers use the standard SEP-41 `token::Client`,
-  which works for SAC-wrapped native assets and custom tokens alike.
-  `token::StellarAssetClient` (mint/clawback/admin) is intentionally unused.
+- **Authorization** — `create_stream`, `withdraw`, and `cancel_stream` each call
+  `require_auth()` on the acting party; token pulls/pushes flow through the
+  SEP-41 `token::Client`, which enforces its own auth.
+- **Check-effects-interactions** — stream state is updated *before* external token
+  calls, and arithmetic overflow traps (rather than wraps) via `overflow-checks = true`.
+- **SAC compatibility** — transfers use the standard SEP-41 `token::Client`, which
+  works for SAC-wrapped native assets and custom tokens alike. The admin-only
+  `token::StellarAssetClient` (mint/clawback) is intentionally unused.
 - **Frontend signing** — transactions are simulated + assembled via
-  `prepareTransaction` (so auth entries/footprints are correct) before Freighter
+  `prepareTransaction` (so auth entries and footprints are correct) before Freighter
   signs; the app never touches private keys.
-- **Indexer scaling** — the backend scans stream ids `0..count` for simplicity.
-  For large fleets, index the contract's `created` / `withdrawn` / `cancelled`
-  events instead (see `StreamEvent`).
+- **Indexer scaling** — the backend scans stream ids `0..count` for simplicity. For
+  large fleets, index the contract's `created` / `withdrawn` / `cancelled` events
+  instead (see `StreamEvent`).
 
----
+See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
 
 ## Networks
 
@@ -196,6 +254,19 @@ Defaults target **Testnet**. For Mainnet, switch `RPC_URL`, `HORIZON_URL`,
 (`Public Global Stellar Network ; September 2015`) and deploy with
 `--network mainnet`.
 
+## Roadmap
+
+- [x] Core linearly-vesting stream contract (`create` / `withdraw` / `cancel` + views + events)
+- [x] Unit, integration, and authorization-tree tests with committed snapshots
+- [x] Express indexer / API (Soroban RPC + Horizon)
+- [x] React + Freighter dashboard (connect, create, withdraw, cancel)
+- [ ] **Split streams** — fan one stream out to multiple receivers
+- [ ] **Dependency streams** — payer → sub-payee chains (multi-tier payroll)
+- [ ] Event-based indexing (replace the id-scan with `created`/`withdrawn`/`cancelled` events)
+- [ ] Token metadata display (symbol + decimals) in the dashboard
+- [ ] Relayer / gasless withdrawals for receivers
+- [ ] Mainnet deployment + third-party audit
+
 ## License
 
-Apache-2.0 (see `LICENSE`).
+[Apache-2.0](LICENSE) © StellarStream-Pay contributors.
