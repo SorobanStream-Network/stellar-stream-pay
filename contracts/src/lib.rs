@@ -622,4 +622,85 @@ mod test {
         let attacker = Address::generate(&env);
         client.cancel_stream(&attacker, &stream_id);
     }
+
+    // ---- Additional edge cases ----------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Contract, #5)")] // Error::InvalidAmount
+    fn create_stream_rejects_zero_amount() {
+        let (_env, client, _contract_id, token, sender, receiver) = setup();
+
+        // `amount` must be strictly positive; zero is rejected before any
+        // token movement or storage write happens.
+        client.create_stream(&sender, &receiver, &token, &0_i128, &100_u64);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Contract, #6)")] // Error::InvalidDuration
+    fn create_stream_rejects_zero_duration() {
+        let (_env, client, _contract_id, token, sender, receiver) = setup();
+
+        // A zero-length stream is degenerate (and would divide by zero in the
+        // vesting math), so it is rejected outright.
+        client.create_stream(&sender, &receiver, &token, &1_000_i128, &0_u64);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Contract, #7)")] // Error::InvalidParties
+    fn create_stream_rejects_sender_as_receiver() {
+        let (_env, client, _contract_id, token, sender, _receiver) = setup();
+
+        // Streaming to yourself is a no-op that would lock and re-pay your own
+        // funds; the contract forbids it.
+        client.create_stream(&sender, &sender, &token, &1_000_i128, &100_u64);
+    }
+
+    #[test]
+    fn cancel_after_full_vest_refunds_zero() {
+        let (env, client, _contract_id, token, sender, receiver) = setup();
+        let token_client = token::Client::new(&env, &token);
+
+        let stream_id = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+
+        // Past the end of the term the entire amount has vested, so there is
+        // no unvested remainder left for the sender to claw back.
+        env.ledger().set_timestamp(START + 200);
+        let refund = client.cancel_stream(&sender, &stream_id);
+        assert_eq!(refund, 0_i128);
+        assert_eq!(token_client.balance(&sender), FUNDING - 1_000);
+
+        // The receiver can still pull the fully-vested amount after the cancel.
+        let withdrawn = client.withdraw(&receiver, &stream_id);
+        assert_eq!(withdrawn, 1_000_i128);
+        assert_eq!(token_client.balance(&receiver), 1_000);
+    }
+
+    #[test]
+    fn multiple_streams_are_independent() {
+        let (env, client, _contract_id, token, sender, receiver) = setup();
+
+        // Two streams with different amounts/durations get distinct ids and
+        // fully independent storage.
+        let id0 = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+        let id1 = client.create_stream(&sender, &receiver, &token, &2_000_i128, &200_u64);
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        assert_eq!(client.get_stream_count(), 2_u64);
+
+        let s0 = client.get_stream(&id0);
+        let s1 = client.get_stream(&id1);
+        assert_eq!(s0.total_amount, 1_000);
+        assert_eq!(s1.total_amount, 2_000);
+
+        // At t=100s, stream #0 (100s term) is fully vested while stream #1
+        // (200s term) is only half vested — accrual is tracked per stream.
+        env.ledger().set_timestamp(START + 100);
+        assert_eq!(client.get_accrued(&id0), 1_000_i128);
+        assert_eq!(client.get_accrued(&id1), 1_000_i128);
+
+        // Withdrawing from one stream leaves the other untouched.
+        let w0 = client.withdraw(&receiver, &id0);
+        assert_eq!(w0, 1_000_i128);
+        assert_eq!(client.get_withdrawable(&id1), 1_000_i128);
+    }
 }
