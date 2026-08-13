@@ -1,0 +1,21 @@
+# Node
+node_modules/
+dist/
+.env
+*.log
+*.tsbuildinfo
+
+# Rust / Soroban
+target/
+contracts/target/
+Cargo.lock
+
+# Note: `contracts/test_snapshots/` is intentionally NOT ignored — the Soroban
+# SDK writes these on every test run as a snapshot-testing mechanism, and the
+# docs recommend committing them to catch behavior changes on contract/SDK
+# upgrades.
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
