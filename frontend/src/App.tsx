@@ -1,38 +1,19 @@
-import { useCallback, useState, type FormEvent } from "react";
-import { CONFIG } from "./config";
+import { useCallback, useState } from "react";
+import { getStreams } from "./lib/api/indexer";
 import {
   cancelStream,
   createStream,
-  connectWallet,
   withdrawStream,
-} from "./lib/soroban";
-
-/** Shape returned by the backend `/api/stream/:address` endpoint. */
-type Stream = {
-  id: number;
-  sender: string;
-  receiver: string;
-  token: string;
-  total_amount: string;
-  withdrawn: string;
-  accrued: string;
-  withdrawable: string;
-  start_time: string;
-  end_time: string;
-  cancelled: boolean;
-  progress: number;
-};
-
-const emptyForm = { receiver: "", token: "", amount: "", duration: "" };
-
-/** Group thousands for readability without converting BigInt to Number. */
-function groupDigits(s: string): string {
-  const neg = s.startsWith("-");
-  const digits = neg ? s.slice(1) : s;
-  return (neg ? "-" : "") + digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-}
-
-const short = (addr: string) => `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+} from "./lib/contracts/stream-core";
+import { connectWallet } from "./lib/stellar/wallet";
+import type { Stream } from "./types";
+import { Topbar } from "./components/layout/Topbar";
+import {
+  CreateStreamForm,
+  type CreateStreamFormValues,
+} from "./components/streams/CreateStreamForm";
+import { StreamList } from "./components/streams/StreamList";
+import { Banner } from "./components/ui/Banner";
 
 export default function App() {
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
@@ -42,17 +23,13 @@ export default function App() {
   const [busyId, setBusyId] = useState<number | null>(null);
   const [cancellingId, setCancellingId] = useState<number | null>(null);
   const [creating, setCreating] = useState(false);
-  const [form, setForm] = useState(emptyForm);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const loadStreams = useCallback(async (addr: string) => {
     setLoadingStreams(true);
     try {
-      const res = await fetch(`${CONFIG.backendUrl}/api/stream/${addr}`);
-      if (!res.ok) throw new Error(await res.text());
-      const data = await res.json();
-      setStreams(data.streams ?? []);
+      setStreams(await getStreams(addr));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -106,25 +83,29 @@ export default function App() {
     }
   };
 
-  const handleCreate = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!walletAddress) return;
+  /**
+   * Returns `true` on success (so the form can reset) or `false` after
+   * surfacing the error (so the form keeps the user's input for retry).
+   */
+  const handleCreate = async (values: CreateStreamFormValues): Promise<boolean> => {
+    if (!walletAddress) return false;
     setCreating(true);
     setError(null);
     setNotice(null);
     try {
       const hash = await createStream({
         sender: walletAddress,
-        receiver: form.receiver.trim(),
-        token: form.token.trim(),
-        amount: form.amount.trim(),
-        durationSeconds: Number(form.duration),
+        receiver: values.receiver.trim(),
+        token: values.token.trim(),
+        amount: values.amount.trim(),
+        durationSeconds: Number(values.duration),
       });
       setNotice(`Stream creation submitted: ${hash.slice(0, 14)}…`);
-      setForm(emptyForm);
       await loadStreams(walletAddress);
-    } catch (e2) {
-      setError(e2 instanceof Error ? e2.message : String(e2));
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return false;
     } finally {
       setCreating(false);
     }
@@ -132,28 +113,17 @@ export default function App() {
 
   return (
     <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          <h1>StellarStream&nbsp;·&nbsp;Pay</h1>
-          <p>Continuous streaming payroll on Stellar</p>
-        </div>
-        {walletAddress ? (
-          <div className="wallet">
-            <span className="pill" title={walletAddress}>{short(walletAddress)}</span>
-            <button className="btn secondary" onClick={() => loadStreams(walletAddress)}>
-              {loadingStreams ? "Loading…" : "Refresh"}
-            </button>
-          </div>
-        ) : (
-          <button className="btn primary" onClick={handleConnect} disabled={connecting}>
-            {connecting ? "Connecting…" : "Connect Freighter"}
-          </button>
-        )}
-      </header>
+      <Topbar
+        walletAddress={walletAddress}
+        connecting={connecting}
+        loadingStreams={loadingStreams}
+        onConnect={handleConnect}
+        onRefresh={() => loadStreams(walletAddress!)}
+      />
 
       <main>
-        {error && <div className="banner error">{error}</div>}
-        {notice && <div className="banner success">{notice}</div>}
+        {error && <Banner variant="error">{error}</Banner>}
+        {notice && <Banner variant="success">{notice}</Banner>}
 
         {!walletAddress && (
           <section className="hero">
@@ -167,130 +137,16 @@ export default function App() {
 
         {walletAddress && (
           <>
-            <section className="panel">
-              <h2>Create a stream</h2>
-              <form className="grid" onSubmit={handleCreate}>
-                <label>
-                  Receiver (G…)
-                  <input
-                    required
-                    placeholder="GBVZ…"
-                    value={form.receiver}
-                    onChange={(e) => setForm({ ...form, receiver: e.target.value })}
-                  />
-                </label>
-                <label>
-                  Token contract (C…)
-                  <input
-                    required
-                    placeholder="C… (SAC-wrapped asset or SEP-41 token)"
-                    value={form.token}
-                    onChange={(e) => setForm({ ...form, token: e.target.value })}
-                  />
-                </label>
-                <label>
-                  Amount (base units)
-                  <input
-                    required
-                    inputMode="numeric"
-                    placeholder="1000000000"
-                    value={form.amount}
-                    onChange={(e) => setForm({ ...form, amount: e.target.value })}
-                  />
-                </label>
-                <label>
-                  Duration (seconds)
-                  <input
-                    required
-                    type="number"
-                    min="1"
-                    placeholder="2592000"
-                    value={form.duration}
-                    onChange={(e) => setForm({ ...form, duration: e.target.value })}
-                  />
-                </label>
-                <button className="btn primary" type="submit" disabled={creating}>
-                  {creating ? "Submitting…" : "Lock & stream"}
-                </button>
-              </form>
-            </section>
-
-            <section className="panel">
-              <h2>Your streams</h2>
-              {loadingStreams && <p className="muted">Loading streams…</p>}
-              {!loadingStreams && streams.length === 0 && (
-                <p className="muted">No streams found for this address yet.</p>
-              )}
-              <ul className="streams">
-                {streams.map((s) => {
-                  const outgoing = s.sender === walletAddress;
-                  // A cancelled stream is still claimable by the receiver for
-                  // the portion that vested before cancellation.
-                  const canWithdraw =
-                    s.receiver === walletAddress &&
-                    BigInt(s.withdrawable) > 0n;
-                  // Senders may cancel an active stream and reclaim the
-                  // unvested remainder.
-                  const canCancel = s.sender === walletAddress && !s.cancelled;
-                  return (
-                    <li key={s.id} className={`card ${s.cancelled ? "cancelled" : ""}`}>
-                      <div className="card-head">
-                        <span className="mono">Stream #{s.id}</span>
-                        <span className={`tag ${outgoing ? "out" : "in"}`}>
-                          {outgoing ? "Sending" : "Receiving"}
-                        </span>
-                      </div>
-                      <div className="row">
-                        <span className="muted">Token</span>
-                        <span className="mono" title={s.token}>{short(s.token)}</span>
-                      </div>
-                      <div className="row">
-                        <span className="muted">Total</span>
-                        <span>{groupDigits(s.total_amount)}</span>
-                      </div>
-                      <div className="row">
-                        <span className="muted">Accrued</span>
-                        <span>{groupDigits(s.accrued)}</span>
-                      </div>
-                      <div className="row">
-                        <span className="muted">Withdrawable</span>
-                        <span>{groupDigits(s.withdrawable)}</span>
-                      </div>
-                      <div className="meter">
-                        <div className="meter-fill" style={{ width: `${Math.round(s.progress * 100)}%` }} />
-                      </div>
-                      <div className="row">
-                        <span className="muted">
-                          {s.cancelled
-                            ? "Cancelled"
-                            : `${Math.round(s.progress * 100)}% vested`}
-                        </span>
-                        <span className="row-actions">
-                          {canWithdraw && (
-                            <button
-                              className="btn primary small"
-                              onClick={() => handleWithdraw(s)}
-                              disabled={busyId === s.id}
-                            >
-                              {busyId === s.id ? "Withdrawing…" : "Withdraw"}
-                            </button>
-                          )}
-                          {canCancel && (
-                            <button
-                              className="btn secondary small"
-                              onClick={() => handleCancel(s)}
-                              disabled={cancellingId === s.id}
-                            >
-                              {cancellingId === s.id ? "Cancelling…" : "Cancel"}
-                            </button>
-                          )}
-                        </span>
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            </section>
+            <CreateStreamForm creating={creating} onSubmit={handleCreate} />
+            <StreamList
+              streams={streams}
+              walletAddress={walletAddress}
+              loading={loadingStreams}
+              busyId={busyId}
+              cancellingId={cancellingId}
+              onWithdraw={handleWithdraw}
+              onCancel={handleCancel}
+            />
           </>
         )}
       </main>
