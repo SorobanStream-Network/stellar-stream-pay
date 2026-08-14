@@ -193,28 +193,51 @@ app.get("/api/account/:address", async (req, res) => {
 //
 // The contract publishes a `StreamEvent` on every state change with four
 // topics — [kind, stream_id, sender, receiver] — and a map value carrying
-// { token, amount, start_time, end_time }. Indexers poll `getEvents` (Soroban
-// RPC has no websocket push yet) and fold each event into their own
-// stream-state cache instead of scanning storage ids.
+// { token, amount, receiver_amount, start_time, end_time }. It also publishes
+// a `SplitEvent` once per split group with topics [kind, root_id, sender] and
+// a map value carrying { token, member_ids, total_amount }. Indexers poll
+// `getEvents` (Soroban RPC has no websocket push yet) and fold each event into
+// their own stream-state cache instead of scanning storage ids.
 const EVENT_KINDS = ["created", "withdraw", "cancelled"];
 // `getEvents` matches topics via a list of filters, each an array of
 // SegmentMatchers ("*" = one topic, "**" = one-or-more topics, or a base64
 // ScVal for an exact match). A `#[contractevent]` publishes its name
-// ("stream_event") as topic[0] and the `#[topic]` fields after it, so the kind
-// symbol lives at topic[1]. We OR one filter per kind and let "**" swallow the
-// trailing stream_id/sender/receiver topics.
+// ("stream_event" / "split_event") as topic[0] and the `#[topic]` fields after
+// it, so the kind symbol lives at topic[1]. We OR one filter per kind and let
+// "**" swallow the trailing topics.
 const EVENT_TOPICS_FILTER = EVENT_KINDS.map((k) => [
   nativeToScVal("stream_event", { type: "symbol" }).toXDR("base64"),
   nativeToScVal(k, { type: "symbol" }).toXDR("base64"),
   "**",
 ]);
+// Split-group membership event (published once per group at creation).
+const SPLIT_EVENT_TOPICS_FILTER = [
+  nativeToScVal("split_event", { type: "symbol" }).toXDR("base64"),
+  nativeToScVal("split_created", { type: "symbol" }).toXDR("base64"),
+  "**",
+];
 
 /** Decode one raw RPC event into a plain, JSON-safe object. */
 function decodeEvent(e) {
-  // Topics: [event_name, kind, stream_id, sender, receiver].
-  const [, kind, streamId, sender, receiver] = e.topic.map(scValToNative);
-  // Map-format event value: { token, amount, start_time, end_time }.
+  const topics = e.topic.map(scValToNative);
   const value = scValToNative(e.value);
+  if (topics[0] === "split_event") {
+    // Topics: [event_name, kind, root_id, sender].
+    const [, kind, rootId, sender] = topics;
+    return {
+      kind,
+      root_id: Number(rootId),
+      sender,
+      token: value.token,
+      member_ids: (value.member_ids ?? []).map(Number),
+      total_amount: value.total_amount != null ? String(value.total_amount) : null,
+      ledger: e.ledger,
+      txHash: e.txHash,
+      id: e.id,
+    };
+  }
+  // Stream event. Topics: [event_name, kind, stream_id, sender, receiver].
+  const [, kind, streamId, sender, receiver] = topics;
   return {
     kind,
     stream_id: Number(streamId),
@@ -222,6 +245,7 @@ function decodeEvent(e) {
     receiver,
     token: value.token,
     amount: String(value.amount),
+    receiver_amount: value.receiver_amount != null ? String(value.receiver_amount) : null,
     start_time: value.start_time != null ? String(value.start_time) : null,
     end_time: value.end_time != null ? String(value.end_time) : null,
     ledger: e.ledger,
@@ -245,7 +269,7 @@ async function queryContractEvents({ startLedger, cursor, limit = 100 }) {
       {
         type: "contract",
         contractIds: [STREAM_CONTRACT_ID],
-        topics: EVENT_TOPICS_FILTER,
+        topics: [...EVENT_TOPICS_FILTER, SPLIT_EVENT_TOPICS_FILTER],
       },
     ],
     limit: Math.min(limit, 100),
