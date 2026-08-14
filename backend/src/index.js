@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { nativeToScVal, scValToNative, Horizon } from "@stellar/stellar-sdk";
+import { nativeToScVal, scValToNative, xdr, Horizon } from "@stellar/stellar-sdk";
 import { Server } from "@stellar/stellar-sdk/rpc";
 
 // ---------------------------------------------------------------------------
@@ -35,13 +35,18 @@ app.use(express.json());
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Storage layout mirror (must match contracts/src/lib.rs):
-//   * streams  -> persistent storage, key = u64 stream id (scvU64)
-//   * counter  -> persistent storage, key = symbol "count"  (scvSymbol)
-// The RPC `getContractData` reads these entries directly; `scValToNative`
-// turns the ScVal back into plain JS (u64/i128 -> BigInt, Address -> string).
-const COUNTER_KEY = nativeToScVal("count", { type: "symbol" });
-const streamKey = (id) => nativeToScVal(id, { type: "u64" });
+// Storage layout mirror (must match contracts/src/lib.rs `DataKey`):
+//   * counter -> DataKey::Counter        == scvVec([scvSymbol("Counter")])
+//   * stream  -> DataKey::Stream(u64 id) == scvVec([scvSymbol("Stream"), scvU64(id)])
+// A `#[contracttype]` enum serializes as a Vec with a leading Symbol
+// discriminant. The contract's `data_key_encoding_matches_backend_expectations`
+// test pins these exact keys.
+const COUNTER_KEY = xdr.ScVal.scvVec([nativeToScVal("Counter", { type: "symbol" })]);
+const streamKey = (id) =>
+  xdr.ScVal.scvVec([
+    nativeToScVal("Stream", { type: "symbol" }),
+    nativeToScVal(id, { type: "u64" }),
+  ]);
 
 /** Read one stream's raw data; returns a decoded object or null if absent. */
 async function readStream(streamId) {
@@ -139,9 +144,8 @@ app.get("/health", async (_req, res) => {
 });
 
 // Active (and past) streams involving `address`, either as sender or receiver.
-// We scan ids [0, streamCount) and filter in-process; for very large fleets
-// swap this for event-based indexing (the contract already emits `created`,
-// `withdrawn` and `cancelled` events for that purpose).
+// We scan ids [0, streamCount) and filter in-process. For large fleets, prefer
+// event-based indexing via `/api/events` (see below) instead of scanning ids.
 app.get("/api/stream/:address", async (req, res) => {
   if (!STREAM_CONTRACT_ID) {
     return res.status(400).json({ error: "STREAM_CONTRACT_ID is not configured on the server." });
@@ -178,6 +182,82 @@ app.get("/api/account/:address", async (req, res) => {
         balance: b.balance,
       })),
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Event-based indexing
+// ---------------------------------------------------------------------------
+//
+// The contract publishes a `StreamEvent` on every state change with four
+// topics — [kind, stream_id, sender, receiver] — and a map value carrying
+// { token, amount, start_time, end_time }. Indexers poll `getEvents` (Soroban
+// RPC has no websocket push yet) and fold each event into their own
+// stream-state cache instead of scanning storage ids.
+const EVENT_KINDS = ["created", "withdraw", "cancelled"];
+// `getEvents` filters topics by base64-encoded ScVal strings; match any of the
+// three kind symbols in topic position 0.
+const EVENT_TOPICS_FILTER = [
+  EVENT_KINDS.map((k) => nativeToScVal(k, { type: "symbol" }).toXDR("base64")),
+];
+
+/** Decode one raw RPC event into a plain, JSON-safe object. */
+function decodeEvent(e) {
+  const [kind, streamId, sender, receiver] = e.topic.map(scValToNative);
+  // Map-format event value: { token, amount, start_time, end_time }.
+  const value = scValToNative(e.value);
+  return {
+    kind,
+    stream_id: Number(streamId),
+    sender,
+    receiver,
+    token: value.token,
+    amount: String(value.amount),
+    start_time: value.start_time != null ? String(value.start_time) : null,
+    end_time: value.end_time != null ? String(value.end_time) : null,
+    ledger: e.ledger,
+    txHash: e.txHash,
+    id: e.id,
+  };
+}
+
+/**
+ * Query the contract's lifecycle events since `startLedger` (inclusive),
+ * returning at most `limit` (≤ 100) matching events plus the pagination
+ * cursor for the next page.
+ */
+async function queryContractEvents(startLedger = 0, limit = 100) {
+  const res = await rpc.getEvents({
+    startLedger,
+    filters: [
+      {
+        type: "contract",
+        contractIds: [STREAM_CONTRACT_ID],
+        topics: EVENT_TOPICS_FILTER,
+      },
+    ],
+    limit: Math.min(limit, 100),
+  });
+  return {
+    events: res.events.map(decodeEvent),
+    cursor: res.cursor,
+    latestLedger: res.latestLedger,
+  };
+}
+
+// Recent lifecycle events (`created` / `withdraw` / `cancelled`) for the
+// contract. Page with `?startLedger=<n>` or the returned `cursor`.
+app.get("/api/events", async (req, res) => {
+  if (!STREAM_CONTRACT_ID) {
+    return res.status(400).json({ error: "STREAM_CONTRACT_ID is not configured on the server." });
+  }
+  const startLedger = Number(req.query.startLedger ?? 0);
+  const limit = Number(req.query.limit ?? 100);
+  try {
+    const { events, cursor, latestLedger } = await queryContractEvents(startLedger, limit);
+    res.json({ contract: STREAM_CONTRACT_ID, count: events.length, cursor, latestLedger, events });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

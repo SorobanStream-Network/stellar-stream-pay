@@ -83,12 +83,34 @@
           ]
         }
       ]
+    ],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
+              "function_name": "cancel",
+              "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "u64": "0"
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
     ]
   ],
   "ledger": {
     "protocol_version": 27,
     "sequence_number": 0,
-    "timestamp": 1000000,
+    "timestamp": 1000050,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
     "min_persistent_entry_ttl": 4096,
@@ -141,6 +163,26 @@
           "data": {
             "contract_data": {
               "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+              "key": {
+                "ledger_key_nonce": {
+                  "nonce": "1033654523790656264"
+                }
+              },
+              "durability": "temporary",
+              "val": "void"
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
               "key": {
                 "vec": [
@@ -154,7 +196,34 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "999999000"
+                "i128": "999999500"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Balance"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "i128": "500"
               }
             }
           },
@@ -181,7 +250,7 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "1000"
+                "i128": "0"
               }
             }
           },
@@ -261,7 +330,7 @@
                       "symbol": "cancelled"
                     },
                     "val": {
-                      "bool": false
+                      "bool": true
                     }
                   },
                   {
@@ -269,7 +338,7 @@
                       "symbol": "cancelled_at"
                     },
                     "val": {
-                      "u64": "0"
+                      "u64": "1000050"
                     }
                   },
                   {
@@ -325,7 +394,7 @@
                       "symbol": "withdrawn"
                     },
                     "val": {
-                      "i128": "0"
+                      "i128": "500"
                     }
                   }
                 ]
@@ -388,7 +457,7 @@
                 "symbol": "stream_event"
               },
               {
-                "symbol": "created"
+                "symbol": "cancelled"
               },
               {
                 "u64": "0"
@@ -407,7 +476,7 @@
                     "symbol": "amount"
                   },
                   "val": {
-                    "i128": "1000"
+                    "i128": "500"
                   }
                 },
                 {

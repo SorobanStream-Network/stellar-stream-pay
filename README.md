@@ -33,8 +33,8 @@ far — on demand, at any time, without further involvement from the sender.
 
 - **Sender** → `create_stream(...)` locks funds in the vault and starts the clock.
 - **Receiver** → `withdraw(...)` pulls the accrued, un-withdrawn amount at any time.
-- **Sender** → `cancel_stream(...)` stops vesting and refunds the unvested remainder
-  (the already-vested portion stays claimable by the receiver).
+- **Sender or receiver** → `cancel(...)` stops the stream, pays out the vested
+  remainder to the receiver, and refunds the unvested remainder to the sender.
 
 Every mutating call enforces `require_auth()` on the acting party, and all token
 movement flows through the standard [SEP-41](https://developers.stellar.org/docs/tokens/token-interface)
@@ -62,8 +62,8 @@ Contracts (SAC) and custom tokens.
                           │  }                          │
                           └───────┬──────────────┬──────┘
                                   │              │
-        withdraw(accrued)         │              │  cancel_stream(refund)
-        require_auth(receiver)    │              │  require_auth(sender)
+        withdraw(accrued)         │              │  cancel(refund)
+        require_auth(receiver)    │              │  require_auth(sender or receiver)
                                   ▼              ▼
                ┌────────────────────────┐   ┌────────────────────────┐
                │    Receiver (payee)    │   │   Employer (refund)    │
@@ -82,7 +82,7 @@ Contracts (SAC) and custom tokens.
   Soroban RPC (`getContractData`) and classic balances via Horizon, serving the
   frontend with decorated stream data (`accrued`, `withdrawable`, `progress`).
 - **Frontend** (`frontend/`) — Freighter wallet integration; builds, simulates,
-  assembles, signs, and submits `create_stream` / `withdraw` / `cancel_stream`
+  assembles, signs, and submits `create_stream` / `withdraw` / `cancel`
   transactions with `@stellar/stellar-sdk`.
 
 ## Features
@@ -104,7 +104,8 @@ Contracts (SAC) and custom tokens.
 ```text
 stellar-stream-pay/
 ├── contracts/              # Rust / Soroban smart contract
-│   ├── src/lib.rs          #   create_stream, withdraw, cancel_stream + views
+│   ├── src/lib.rs          #   create_stream, withdraw, cancel + views
+│   ├── src/test.rs         #   unit + integration tests (mock SAC token)
 │   ├── Cargo.toml          #   soroban-sdk, cdylib crate, release profile
 │   └── test_snapshots/     #   committed SDK snapshot tests
 ├── backend/                # Node.js / Express indexer & API
@@ -187,6 +188,7 @@ The server listens on `http://localhost:4000`:
 | `GET /health` | RPC connectivity + network info |
 | `GET /api/stream/:address` | Streams where `:address` is sender or receiver (Soroban RPC) |
 | `GET /api/account/:address` | Classic/SAC balances for an address (Horizon) |
+| `GET /api/events` | Lifecycle events (`created` / `withdraw` / `cancelled`) for the contract |
 
 ```bash
 curl http://localhost:4000/api/stream/GBVZ...YOUR...ADDRESS
@@ -215,22 +217,22 @@ With the backend running (`VITE_BACKEND_URL`):
 |----------|------|-------------|
 | `create_stream(sender, receiver, token, amount, duration_seconds) -> u64` | `sender` | Locks `amount` (base units) from `sender` and starts a stream. |
 | `withdraw(receiver, stream_id) -> i128` | `receiver` | Pays out the currently accrued (un-withdrawn) amount. |
-| `cancel_stream(sender, stream_id) -> i128` | `sender` | Cancels and refunds the unvested remainder to `sender`. |
+| `cancel(caller, stream_id) -> i128` | `sender` or `receiver` | Settles the stream: pays the vested remainder to the receiver and refunds the unvested remainder to the sender. |
 | `get_stream(stream_id) -> Stream` | — | Read a stream. |
-| `get_accrued(stream_id) -> i128` | — | Current vested amount. |
+| `streamed_amount(stream_id) -> i128` | — | Current vested amount (pro-rata). |
 | `get_withdrawable(stream_id) -> i128` | — | Amount currently available to withdraw. |
 | `get_stream_count() -> u64` | — | Total streams ever created. |
 
 ### Storage layout (for indexers)
 
-- Streams: **persistent** storage, keyed by `u64` stream id.
-- Stream counter: **persistent** storage, keyed by `Symbol("count")`.
+- Streams: **persistent** storage, keyed by `DataKey::Stream(u64)`.
+- Stream counter: **persistent** storage, keyed by `DataKey::Counter`.
 
 The backend reads both directly via RPC `getContractData`.
 
 ## Security
 
-- **Authorization** — `create_stream`, `withdraw`, and `cancel_stream` each call
+- **Authorization** — `create_stream`, `withdraw`, and `cancel` each call
   `require_auth()` on the acting party; token pulls/pushes flow through the
   SEP-41 `token::Client`, which enforces its own auth.
 - **Check-effects-interactions** — stream state is updated *before* external token

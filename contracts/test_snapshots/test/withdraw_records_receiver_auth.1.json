@@ -289,7 +289,38 @@
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
               "key": {
-                "u64": "0"
+                "vec": [
+                  {
+                    "symbol": "Counter"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u64": "1"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Stream"
+                  },
+                  {
+                    "u64": "0"
+                  }
+                ]
               },
               "durability": "persistent",
               "val": {
@@ -381,26 +412,6 @@
             "contract_data": {
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
-              "key": {
-                "symbol": "count"
-              },
-              "durability": "persistent",
-              "val": {
-                "u64": "1"
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 4095
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM",
               "key": "ledger_key_contract_instance",
               "durability": "persistent",
               "val": {
@@ -446,6 +457,9 @@
                 "symbol": "stream_event"
               },
               {
+                "symbol": "withdraw"
+              },
+              {
                 "u64": "0"
               },
               {
@@ -467,10 +481,18 @@
                 },
                 {
                   "key": {
-                    "symbol": "kind"
+                    "symbol": "end_time"
                   },
                   "val": {
-                    "symbol": "withdrawn"
+                    "u64": "1000100"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "start_time"
+                  },
+                  "val": {
+                    "u64": "1000000"
                   }
                 },
                 {

@@ -105,9 +105,9 @@ export async function withdrawStream(
 }
 
 /**
- * Invoke `cancel_stream(stream_id)` on behalf of the connected sender.
- * Refunds the unvested remainder to the sender; any already-vested amount
- * stays locked in the contract and remains withdrawable by the receiver.
+ * Invoke `cancel(stream_id)` on behalf of the connected sender or receiver.
+ * Cancelling fully settles the stream: the vested remainder is paid to the
+ * receiver and the unvested remainder is refunded to the sender in one call.
  */
 export async function cancelStream(
   sender: string,
@@ -124,7 +124,7 @@ export async function cancelStream(
   })
     .addOperation(
       contract.call(
-        "cancel_stream",
+        "cancel",
         new Address(sender).toScVal(),
         nativeToScVal(streamId, { type: "u64" }),
       ),
