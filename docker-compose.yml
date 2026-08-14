@@ -1,0 +1,32 @@
+# StellarStream-Pay — local orchestration (backend + frontend).
+#
+# Build & run:
+#   STREAM_CONTRACT_ID=C... docker compose up --build
+#
+# Env vars are optional; backend/.env.example and frontend/.env.example document
+# them. Defaults below target Testnet.
+
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      PORT: "4000"
+      RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      HORIZON_URL: ${HORIZON_URL:-https://horizon-testnet.stellar.org}
+      STREAM_CONTRACT_ID: ${STREAM_CONTRACT_ID:-}
+    ports:
+      - "4000:4000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_CONTRACT_ID: ${VITE_CONTRACT_ID:-}
+        # The browser (on your host) reaches the backend via the published
+        # port, so this stays localhost rather than the compose service name.
+        VITE_BACKEND_URL: ${VITE_BACKEND_URL:-http://localhost:4000}
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend

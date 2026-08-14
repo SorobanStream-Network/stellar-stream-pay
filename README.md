@@ -117,11 +117,18 @@ stellar-stream-pay/
 │       ├── Cargo.toml      #     stream-core package (soroban-sdk, proptest)
 │       └── test_snapshots/ #     committed SDK snapshot tests
 ├── backend/                # Node.js / Express indexer & API
-│   └── src/index.js        #   reads stream state from Soroban RPC + Horizon
+│   ├── src/index.js        #   reads stream state from Soroban RPC + Horizon
+│   └── Dockerfile          #   container image
 ├── frontend/               # React / Vite DApp with Freighter wallet
 │   ├── src/App.tsx         #   dashboard: view/manage streams, trigger actions
-│   └── src/lib/soroban.ts  #   wallet + transaction helpers
-├── .github/workflows/      # CI (cargo check + test + Soroban Wasm build)
+│   ├── src/lib/soroban.ts  #   wallet + transaction helpers
+│   └── Dockerfile          #   multi-stage build + nginx serve
+├── docs/                   # architecture & design docs
+├── .github/workflows/      # CI (contract, backend, frontend, PR title lint)
+├── docker-compose.yml      # local orchestration (backend + frontend)
+├── CONTRIBUTING.md         # development workflow & conventions
+├── CODE_OF_CONDUCT.md      # community guidelines
+├── CHANGELOG.md            # version history
 ├── SECURITY.md             # vulnerability disclosure policy
 └── README.md
 ```
@@ -219,6 +226,19 @@ With the backend running (`VITE_BACKEND_URL`):
 3. Streams where you are the receiver show a **Withdraw** button once something
    has vested; streams you sent show a **Cancel** button.
 
+### 4. Run with Docker
+
+Both services ship container images plus a `docker-compose.yml`:
+
+```bash
+export STREAM_CONTRACT_ID=C...   # backend
+VITE_CONTRACT_ID=C... docker compose up --build
+```
+
+Serves the backend on `http://localhost:4000` and the frontend (with
+`VITE_CONTRACT_ID` baked in at build time) on `http://localhost:8080`. All env
+vars have Testnet defaults — see the `.env.example` files.
+
 ## Contract API
 
 | Function | Auth | Description |
@@ -279,6 +299,13 @@ Defaults target **Testnet**. For Mainnet, switch `RPC_URL`, `HORIZON_URL`,
 - [ ] Token metadata display (symbol + decimals) in the dashboard
 - [ ] Relayer / gasless withdrawals for receivers
 - [ ] Mainnet deployment + third-party audit
+
+## Contributing
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development workflow, testing, and commit/PR conventions.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community guidelines.
+- [docs/architecture.md](docs/architecture.md) — system architecture (C4-style diagrams).
+- [CHANGELOG.md](CHANGELOG.md) — version history.
 
 ## License
 
