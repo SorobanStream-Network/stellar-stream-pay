@@ -90,6 +90,7 @@ pub enum Error {
     InvalidAmount = 5,
     InvalidDuration = 6,
     InvalidParties = 7,
+    TokenTransferMismatch = 8,
 }
 
 #[contract]
@@ -127,16 +128,10 @@ impl StreamingContract {
             None => panic_with_error!(&env, Error::InvalidDuration),
         };
 
-        // Lock funds: pull `amount` from the sender into the contract's own
-        // balance. `token::Client` requires the sender's auth for the transfer,
-        // which flows through because we are invoked in the sender's
-        // transaction. Works for SAC assets and any SEP-41 token.
-        token::Client::new(&env, &token).transfer(
-            &sender,
-            &env.current_contract_address(),
-            &amount,
-        );
-
+        // FIX: write state BEFORE the external token call (check-effects-
+        // interactions). Soroban transactions are atomic, so if the pull below
+        // reverts, this state is rolled back too — but a reentrant call can
+        // only ever observe finalized state.
         let stream_id = Self::next_id(&env);
         env.storage().persistent().set(
             &DataKey::Stream(stream_id),
@@ -156,6 +151,28 @@ impl StreamingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Counter, &(stream_id + 1));
+
+        // Lock funds: pull `amount` from the sender into the contract's own
+        // balance. `token::Client` requires the sender's auth for the transfer,
+        // which flows through because we are invoked in the sender's
+        // transaction. Works for SAC assets and any SEP-41 token.
+        //
+        // FIX: verify the contract actually received exactly `amount`. A
+        // fee-on-transfer or otherwise non-conforming token would otherwise
+        // leave the stream under-collateralized relative to `total_amount`.
+        let contract = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+        let bal_before = token_client.balance(&contract);
+        token_client.transfer(&sender, &contract, &amount);
+        let bal_after = token_client.balance(&contract);
+        if bal_after - bal_before != amount {
+            panic_with_error!(&env, Error::TokenTransferMismatch);
+        }
+
+        // FIX: extend the new entries' TTL so long-running streams don't get
+        // archived mid-term (persistent entries expire after `max_ttl`).
+        Self::bump_ttl(&env, &DataKey::Stream(stream_id));
+        Self::bump_ttl(&env, &DataKey::Counter);
 
         StreamEvent {
             kind: symbol_short!("created"),
@@ -195,6 +212,8 @@ impl StreamingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
+        // FIX: extend TTL so the stream entry survives until fully withdrawn.
+        Self::bump_ttl(&env, &DataKey::Stream(stream_id));
 
         // Pay out. The contract is the `from`; the token contract's own
         // `require_auth` for the contract address is satisfied because this
@@ -250,6 +269,8 @@ impl StreamingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
+        // FIX: extend TTL so the now-frozen stream entry remains readable.
+        Self::bump_ttl(&env, &DataKey::Stream(stream_id));
 
         if unwithdrawn > 0 {
             token::Client::new(&env, &stream.token).transfer(
@@ -308,6 +329,19 @@ impl StreamingContract {
 
     fn next_id(env: &Env) -> u64 {
         env.storage().persistent().get(&DataKey::Counter).unwrap_or(0)
+    }
+
+    /// FIX: extend a persistent entry's TTL so long-running streams don't get
+    /// archived while still active. `set` resets TTL on write, but a stream
+    /// that is only *read* (via views) for longer than `max_ttl` would expire;
+    /// bumping here keeps it alive. (Ledgers ≈ 5s; 30 days ≈ 518_400 ledgers.)
+    fn bump_ttl(env: &Env, key: &DataKey) {
+        const THIRTY_DAYS_LEDGERS: u32 = 30 * 24 * 60 * 12;
+        env.storage().persistent().extend_ttl(
+            key,
+            THIRTY_DAYS_LEDGERS,
+            env.storage().max_ttl(),
+        );
     }
 
     fn load(env: &Env, stream_id: u64) -> Stream {

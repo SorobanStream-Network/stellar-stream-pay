@@ -9,6 +9,7 @@ use soroban_sdk::{
     token, Address, Env, IntoVal, Symbol,
 };
 use soroban_sdk::xdr::{Limits, ScVal, WriteXdr};
+use soroban_sdk::testutils::storage::Persistent as _;
 
 // ---- Mock SEP-41 token --------------------------------------------------
 //
@@ -59,6 +60,60 @@ impl MockToken {
         env.storage()
             .persistent()
             .set(&to_key, &(to_balance + amount));
+    }
+}
+
+// ---- Fee-on-transfer mock token ------------------------------------------
+//
+// Like `MockToken`, but every `transfer` deducts a flat fee from the credited
+// amount. Used to prove that `create_stream` rejects tokens whose transfer
+// doesn't credit the contract with the exact requested amount.
+
+const TRANSFER_FEE: i128 = 100;
+
+#[contract]
+pub struct FeeToken;
+
+#[contracttype]
+#[derive(Clone)]
+enum FeeTokenKey {
+    Balance(Address),
+}
+
+#[contractimpl]
+impl FeeToken {
+    pub fn mint(env: Env, admin: Address, to: Address, amount: i128) {
+        admin.require_auth();
+        let key = FeeTokenKey::Balance(to);
+        let b: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(b + amount));
+    }
+
+    pub fn balance(env: Env, addr: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&FeeTokenKey::Balance(addr))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        if amount <= 0 {
+            return;
+        }
+        // Charge a flat fee: the recipient only receives `amount - fee`.
+        let credited = amount - TRANSFER_FEE;
+        let from_key = FeeTokenKey::Balance(from);
+        let to_key = FeeTokenKey::Balance(to);
+        let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+        assert!(from_balance >= amount, "insufficient balance");
+        let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&from_key, &(from_balance - amount));
+        env.storage()
+            .persistent()
+            .set(&to_key, &(to_balance + credited));
     }
 }
 
@@ -438,4 +493,65 @@ fn data_key_encoding_matches_backend_expectations() {
         stream7.to_xdr_base64(Limits::none()).unwrap(),
         "AAAAEAAAAAEAAAACAAAADwAAAAZTdHJlYW0AAAAAAAUAAAAAAAAABw=="
     );
+}
+
+// ---- Audit regression tests: fee-on-transfer + TTL -------------------------
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #8)")] // Error::TokenTransferMismatch
+fn create_stream_rejects_fee_on_transfer_token() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let receiver = Address::generate(&env);
+
+    let fee_token = env.register(FeeToken, ());
+    let contract_id = env.register(StreamingContract, ());
+    let client = StreamingContractClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    FeeTokenClient::new(&env, &fee_token).mint(&admin, &sender, &FUNDING);
+    env.ledger().set_timestamp(START);
+
+    // The fee token credits the contract with `amount - fee`, so the balance
+    // delta check in `create_stream` must detect the mismatch and revert.
+    client.create_stream(&sender, &receiver, &fee_token, &1_000_i128, &100_u64);
+}
+
+#[test]
+fn create_stream_sets_stream_ttl_to_max() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+
+    client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+
+    // TTL reads are contract-scoped, so wrap them in `as_contract`. Newly-
+    // created streams must carry the maximum TTL so they don't expire
+    // part-way through a long vesting term.
+    let ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Stream(0))
+    });
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    assert_eq!(ttl, max, "stream entry TTL {ttl} != max {max}");
+}
+
+#[test]
+fn withdraw_bumps_ttl_back_to_max() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    let stream_id = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+
+    // Simulate the stream sitting untouched until its TTL is nearly expired.
+    let ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Stream(stream_id))
+    });
+    env.ledger().set_sequence_number(env.ledger().sequence() + ttl - 100);
+
+    // A mutating op re-writes the entry and bumps its TTL back to max.
+    env.ledger().set_timestamp(START + 50);
+    client.withdraw(&receiver, &stream_id);
+
+    let after = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Stream(stream_id))
+    });
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    assert_eq!(after, max, "withdraw should restore TTL to max, got {after}");
 }
