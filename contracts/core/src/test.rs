@@ -2,11 +2,11 @@
 // library (needed for `std::vec::Vec` in the auth-tree assertions).
 extern crate std;
 
-use super::{vested_amount, DataKey, StreamingContract, StreamingContractClient};
+use super::{vested_amount, DataKey, SplitEvent, StreamEvent, StreamingContract, StreamingContractClient, STREAM_CORE_API_VERSION, MAX_SPLIT_MEMBERS};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec,
-    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger as _},
-    token, Address, Env, IntoVal, Symbol,
+    contract, contractimpl, contracttype, symbol_short, vec, Event,
+    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Events, Ledger as _},
+    token, Address, Env, IntoVal, Symbol, Vec,
 };
 use soroban_sdk::xdr::{Limits, ScVal, WriteXdr};
 use soroban_sdk::testutils::storage::Persistent as _;
@@ -115,6 +115,61 @@ impl FeeToken {
         env.storage()
             .persistent()
             .set(&to_key, &(to_balance + credited));
+    }
+}
+
+// ---- Sender-fee (over-debit) mock token ----------------------------------
+//
+// Like `MockToken`, but `transfer` credits the recipient the full `amount`
+// while debiting the *sender* by `amount + fee`. This is the inverse of the
+// recipient-shorted `FeeToken`: the recipient's balance looks correct, but the
+// paying contract is silently over-charged. Used to prove `transfer_out_exact`
+// (Finding 6) rejects outbound transfers that over-debit the `from` side,
+// which would otherwise drain the contract's shared token pool.
+
+#[contract]
+pub struct SenderFeeToken;
+
+#[contracttype]
+#[derive(Clone)]
+enum SenderFeeTokenKey {
+    Balance(Address),
+}
+
+#[contractimpl]
+impl SenderFeeToken {
+    pub fn mint(env: Env, admin: Address, to: Address, amount: i128) {
+        admin.require_auth();
+        let key = SenderFeeTokenKey::Balance(to);
+        let b: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(b + amount));
+    }
+
+    pub fn balance(env: Env, addr: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&SenderFeeTokenKey::Balance(addr))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        if amount <= 0 {
+            return;
+        }
+        // The recipient is credited in full; the sender is debited extra.
+        let debited = amount + TRANSFER_FEE;
+        let from_key = SenderFeeTokenKey::Balance(from);
+        let to_key = SenderFeeTokenKey::Balance(to);
+        let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+        assert!(from_balance >= debited, "insufficient balance");
+        let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&from_key, &(from_balance - debited));
+        env.storage()
+            .persistent()
+            .set(&to_key, &(to_balance + amount));
     }
 }
 
@@ -252,7 +307,7 @@ fn setup() -> (
     // Deploy the mock token and our streaming contract.
     let token = env.register(MockToken, ());
 
-    let contract_id = env.register(StreamingContract, ());
+    let contract_id = env.register(StreamingContract, (admin.clone(),));
     let client = StreamingContractClient::new(&env, &contract_id);
 
     // Auto-authorize every `require_auth` for the test. The contract's own
@@ -473,7 +528,68 @@ fn settlement_invariant_holds_across_scenarios() {
 #[test]
 fn version_reports_pinned_api_version() {
     let (_env, client, _contract_id, _token, _sender, _receiver) = setup();
-    assert_eq!(client.version(), 1_u32);
+    assert_eq!(client.version(), STREAM_CORE_API_VERSION);
+}
+
+// ---- Event ABI assertions -------------------------------------------------
+//
+// Pin the event shape indexers rely on: a split group emits a `split_created`
+// event carrying its members, and `cancelled` events carry the receiver's
+// payout (`receiver_amount`) in addition to the sender's refund (`amount`).
+
+#[test]
+fn split_creation_emits_group_membership_event() {
+    let (env, client, contract_id, token, sender, _receiver) = setup();
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    let amounts = vec![&env, 300_i128, 700_i128];
+
+    client.create_split_stream(&sender, &receivers, &token, &amounts, &100_u64);
+
+    let expected = SplitEvent {
+        kind: Symbol::new(&env, "split_created"),
+        root_id: 0,
+        sender: sender.clone(),
+        token: token.clone(),
+        member_ids: vec![&env, 0_u64, 1_u64],
+        total_amount: 1_000_i128,
+    }
+    .to_xdr(&env, &contract_id);
+
+    assert!(
+        env.events().all().events().contains(&expected),
+        "split_created group event missing or malformed"
+    );
+}
+
+#[test]
+fn cancel_event_carries_receiver_payout() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+
+    let stream_id = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+    // 25% vested, nothing withdrawn: receiver is owed 250, sender refunded 750.
+    env.ledger().set_timestamp(START + 25);
+    client.cancel(&sender, &stream_id);
+
+    let expected = StreamEvent {
+        kind: symbol_short!("cancelled"),
+        stream_id,
+        sender: sender.clone(),
+        receiver: receiver.clone(),
+        token: token.clone(),
+        amount: 750,
+        receiver_amount: 250,
+        start_time: START,
+        end_time: START + 100,
+    }
+    .to_xdr(&env, &contract_id);
+
+    assert!(
+        env.events().all().events().contains(&expected),
+        "cancelled event missing receiver_amount or malformed"
+    );
 }
 
 // ---- Authorization-tree assertions ----------------------------------------
@@ -678,7 +794,7 @@ fn create_stream_rejects_fee_on_transfer_token() {
     let receiver = Address::generate(&env);
 
     let fee_token = env.register(FeeToken, ());
-    let contract_id = env.register(StreamingContract, ());
+    let contract_id = env.register(StreamingContract, (admin.clone(),));
     let client = StreamingContractClient::new(&env, &contract_id);
 
     env.mock_all_auths();
@@ -688,6 +804,36 @@ fn create_stream_rejects_fee_on_transfer_token() {
     // The fee token credits the contract with `amount - fee`, so the balance
     // delta check in `create_stream` must detect the mismatch and revert.
     client.create_stream(&sender, &receiver, &fee_token, &1_000_i128, &100_u64);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #8)")] // Error::TokenTransferMismatch
+fn withdraw_rejects_sender_over_debit_token() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let receiver = Address::generate(&env);
+
+    let fee_token = env.register(SenderFeeToken, ());
+    let contract_id = env.register(StreamingContract, (admin.clone(),));
+    let client = StreamingContractClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    let token_client = SenderFeeTokenClient::new(&env, &fee_token);
+    token_client.mint(&admin, &sender, &FUNDING);
+    // Give the contract headroom so the over-debit trips the balance-delta
+    // check (Finding 6) rather than the token's own "insufficient balance" guard.
+    token_client.mint(&admin, &contract_id, &TRANSFER_FEE);
+    env.ledger().set_timestamp(START);
+
+    // Creation succeeds: the contract is credited exactly `amount`.
+    let stream_id = client.create_stream(&sender, &receiver, &fee_token, &1_000_i128, &100_u64);
+
+    // Halfway vesting => withdraw 500. The token credits the receiver 500 but
+    // debits the contract 500 + fee; `transfer_out_exact` must detect the
+    // contract-side mismatch and revert.
+    env.ledger().set_timestamp(START + 50);
+    client.withdraw(&receiver, &stream_id);
 }
 
 #[test]
@@ -726,4 +872,497 @@ fn withdraw_bumps_ttl_back_to_max() {
     });
     let max = env.as_contract(&contract_id, || env.storage().max_ttl());
     assert_eq!(after, max, "withdraw should restore TTL to max, got {after}");
+}
+
+#[test]
+fn bump_entrypoint_extends_idle_stream_ttl() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    let stream_id = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+
+    // Simulate an idle stream: no withdraw/cancel, so its TTL drifts toward
+    // expiry. The permissionless `bump` entrypoint must restore it to max
+    // without any authorized caller.
+    let ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Stream(stream_id))
+    });
+    env.ledger().set_sequence_number(env.ledger().sequence() + ttl - 100);
+
+    client.bump(&stream_id);
+
+    let after = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Stream(stream_id))
+    });
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    assert_eq!(after, max, "bump should restore TTL to max, got {after}");
+}
+
+#[test]
+fn bump_re_arms_counter_ttl() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+
+    // Drift the id counter's TTL toward expiry — simulating a long-idle
+    // contract that keeps streams alive via `bump` but creates none. The
+    // counter must be re-armed too, or the next create would reuse id 0 and
+    // overwrite the live stream.
+    let counter_ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Counter)
+    });
+    env.ledger().set_sequence_number(env.ledger().sequence() + counter_ttl - 100);
+
+    client.bump(&0_u64);
+
+    let after = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Counter)
+    });
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    assert_eq!(after, max, "bump must re-arm the id counter to max, got {after}");
+}
+
+// ---- Admin pause (Stage 3) ------------------------------------------------
+
+
+#[test]
+fn pause_blocks_create_but_not_withdraw() {
+    let (env, client, _contract_id, token, sender, receiver) = setup();
+
+    // A stream that already exists and has accrued value.
+    let stream_id = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+    env.ledger().set_timestamp(START + 50);
+    client.pause();
+
+    // Paused → new streams are rejected with Error::Paused (#10).
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+    }));
+    assert!(res.is_err(), "paused contract must reject new streams");
+
+    // ...but the receiver can still withdraw what has already vested — the
+    // pause must never gate access to funds already owed.
+    let withdrew = client.withdraw(&receiver, &stream_id);
+    assert!(withdrew > 0, "withdraw must work while paused");
+}
+
+#[test]
+fn pause_requires_admin_auth() {
+    // No `mock_all_auths`: an arbitrary caller lacks the admin's signature,
+    // so `admin.require_auth()` inside `pause` must fail.
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(StreamingContract, (admin.clone(),));
+    let client = StreamingContractClient::new(&env, &contract_id);
+
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.pause();
+    }));
+    assert!(res.is_err(), "non-admin must not be able to pause");
+}
+
+#[test]
+fn pause_unpause_round_trip() {
+    let (_env, client, _contract_id, token, sender, receiver) = setup();
+
+    assert!(!client.paused(), "fresh contract is un-paused");
+    client.pause();
+    assert!(client.paused(), "paused() view must report paused");
+    client.unpause();
+    assert!(!client.paused(), "paused() view must report un-paused");
+
+    // After unpausing, new stream creation works again (id restarts at 0
+    // because the paused-era create was rejected before the counter moved).
+    let id = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+    assert_eq!(id, 0, "create_stream must work after unpause");
+}
+
+// ---- Split / multi-tier streams (Stage 5) ---------------------------------
+
+#[test]
+fn create_split_stream_uneven_splits() {
+    let (env, client, contract_id, token, sender, _receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone(), r3.clone()];
+    let amounts = vec![&env, 100_i128, 200_i128, 300_i128];
+
+    let root = client.create_split_stream(&sender, &receivers, &token, &amounts, &100_u64);
+    assert_eq!(root, 0);
+    assert_eq!(client.get_stream_count(), 3_u64);
+
+    // Members are ordinary streams at ids 0..2, each with its own share.
+    let s0 = client.get_stream(&0_u64);
+    let s1 = client.get_stream(&1_u64);
+    let s2 = client.get_stream(&2_u64);
+    assert_eq!(s0.receiver, r1);
+    assert_eq!(s1.receiver, r2);
+    assert_eq!(s2.receiver, r3);
+    assert_eq!(s0.total_amount, 100);
+    assert_eq!(s1.total_amount, 200);
+    assert_eq!(s2.total_amount, 300);
+    assert_eq!(s0.sender, sender);
+    assert_eq!(s1.sender, sender);
+    assert_eq!(s2.sender, sender);
+
+    // The group index records the members in allocation order.
+    let group = client.get_split(&root);
+    assert_eq!(group.sender, sender);
+    assert_eq!(group.token, token);
+    assert_eq!(group.member_ids.len(), 3);
+    assert_eq!(group.member_ids.get(0).unwrap(), 0_u64);
+    assert_eq!(group.member_ids.get(1).unwrap(), 1_u64);
+    assert_eq!(group.member_ids.get(2).unwrap(), 2_u64);
+
+    // One aggregate pull: the contract holds the sum, the sender is debited
+    // exactly once for it.
+    assert_eq!(token_client.balance(&contract_id), 600);
+    assert_eq!(token_client.balance(&sender), FUNDING - 600);
+
+    // Halfway through the term each receiver has vested half of their share.
+    env.ledger().set_timestamp(START + 50);
+    assert_eq!(client.streamed_amount(&0_u64), 50_i128);
+    assert_eq!(client.streamed_amount(&1_u64), 100_i128);
+    assert_eq!(client.streamed_amount(&2_u64), 150_i128);
+}
+
+#[test]
+fn split_withdraw_is_independent_per_receiver() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    let amounts = vec![&env, 300_i128, 700_i128];
+
+    let root = client.create_split_stream(&sender, &receivers, &token, &amounts, &100_u64);
+    assert_eq!(root, 0);
+
+    // Halfway: r1 (300) has 150 vested, r2 (700) has 350 vested.
+    env.ledger().set_timestamp(START + 50);
+    let w = client.withdraw(&r1, &0_u64);
+    assert_eq!(w, 150_i128);
+    assert_eq!(token_client.balance(&r1), 150);
+
+    // r1's withdrawal must not touch r2's accrual or withdrawable balance.
+    assert_eq!(client.streamed_amount(&1_u64), 350_i128);
+    assert_eq!(client.get_withdrawable(&1_u64), 350_i128);
+    // And r1 has nothing further withdrawable right now.
+    assert_eq!(client.get_withdrawable(&0_u64), 0_i128);
+}
+
+#[test]
+fn cancel_split_refunds_across_all_receivers() {
+    let (env, client, contract_id, token, sender, _receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone(), r3.clone()];
+    let amounts = vec![&env, 200_i128, 300_i128, 500_i128];
+
+    let root = client.create_split_stream(&sender, &receivers, &token, &amounts, &100_u64);
+    assert_eq!(root, 0);
+
+    // 25% vested when the sender cancels the whole group.
+    env.ledger().set_timestamp(START + 25);
+    let refund = client.cancel_split(&sender, &root);
+    // Unvested 75% of 200+300+500 = 150+225+375 = 750 refunded in ONE call.
+    assert_eq!(refund, 750_i128);
+
+    // Each receiver is paid their vested quarter.
+    assert_eq!(token_client.balance(&r1), 50);
+    assert_eq!(token_client.balance(&r2), 75);
+    assert_eq!(token_client.balance(&r3), 125);
+    // The contract holds nothing; the sender got the aggregate refund back.
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(token_client.balance(&sender), FUNDING - 250);
+
+    // Every member is frozen and fully settled.
+    for id in 0_u64..3_u64 {
+        let s = client.get_stream(&id);
+        assert!(s.cancelled, "member {id} must be cancelled");
+        assert_eq!(client.get_withdrawable(&id), 0_i128);
+    }
+}
+
+#[test]
+fn cancel_split_skips_already_cancelled_members() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    let amounts = vec![&env, 400_i128, 600_i128];
+
+    let root = client.create_split_stream(&sender, &receivers, &token, &amounts, &100_u64);
+
+    // r1 individually cancels their own 400-share stream at 50% vested.
+    env.ledger().set_timestamp(START + 50);
+    let refund1 = client.cancel(&r1, &0_u64);
+    assert_eq!(refund1, 200_i128); // 200 unvested back to the sender
+
+    // The sender then cancels the whole group: member 0 is skipped (already
+    // settled), member 1 is settled at the same timestamp.
+    let refund2 = client.cancel_split(&sender, &root);
+    assert_eq!(refund2, 300_i128); // 300 unvested from member 1 only
+
+    assert_eq!(token_client.balance(&r1), 200);
+    assert_eq!(token_client.balance(&r2), 300);
+    assert_eq!(token_client.balance(&sender), FUNDING - 500);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #1)")] // Error::Unauthorized
+fn cancel_split_rejects_non_sender() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+
+    let r1 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone()];
+    let amounts = vec![&env, 1_000_i128];
+    let root = client.create_split_stream(&sender, &receivers, &token, &amounts, &100_u64);
+    env.ledger().set_timestamp(START + 25);
+
+    // A receiver may cancel their own stream but NOT the whole group.
+    client.cancel_split(&r1, &root);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #13)")] // Error::EmptySplit
+fn split_rejects_empty_receivers() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let receivers: Vec<Address> = vec![&env];
+    let amounts: Vec<i128> = vec![&env];
+    client.create_split_stream(&sender, &receivers, &token, &amounts, &100_u64);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #14)")] // Error::SplitLengthMismatch
+fn split_rejects_length_mismatch() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let r1 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone()];
+    let amounts = vec![&env, 100_i128, 200_i128];
+    client.create_split_stream(&sender, &receivers, &token, &amounts, &100_u64);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #15)")] // Error::DuplicateReceiver
+fn split_rejects_duplicate_receiver() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let r1 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r1.clone()];
+    let amounts = vec![&env, 100_i128, 200_i128];
+    client.create_split_stream(&sender, &receivers, &token, &amounts, &100_u64);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #19)")] // Error::SplitTooManyReceivers
+fn split_rejects_too_many_receivers() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+
+    let mut receivers: Vec<Address> = Vec::new(&env);
+    let mut amounts: Vec<i128> = Vec::new(&env);
+    for _ in 0..(MAX_SPLIT_MEMBERS + 1) {
+        receivers.push_back(Address::generate(&env));
+        amounts.push_back(1_i128);
+    }
+
+    client.create_split_stream(&sender, &receivers, &token, &amounts, &100_u64);
+}
+
+// ---- Percentage (basis-point) splits (Stage 5 follow-up) -------------------
+
+#[test]
+fn create_split_stream_bps_allocates_exact_shares() {
+    let (env, client, contract_id, token, sender, _receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    let bps = vec![&env, 3_000_u32, 7_000_u32];
+
+    let root = client.create_split_stream_bps(
+        &sender, &receivers, &token, &10_000_i128, &bps, &100_u64,
+    );
+    assert_eq!(root, 0);
+    assert_eq!(client.get_stream_count(), 2_u64);
+
+    // 30% / 70% of 10,000 → 3,000 and 7,000 exactly.
+    assert_eq!(client.get_stream(&0_u64).total_amount, 3_000_i128);
+    assert_eq!(client.get_stream(&1_u64).total_amount, 7_000_i128);
+    // One aggregate pull of the full total.
+    assert_eq!(token_client.balance(&contract_id), 10_000);
+    assert_eq!(token_client.balance(&sender), FUNDING - 10_000);
+}
+
+#[test]
+fn split_bps_rounds_dust_without_loss_or_gain() {
+    let (env, client, contract_id, token, sender, _receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone(), r3.clone()];
+    // 33.34% / 33.33% / 33.33% of 100 base units.
+    let bps = vec![&env, 3_334_u32, 3_333_u32, 3_333_u32];
+
+    let root = client.create_split_stream_bps(
+        &sender, &receivers, &token, &100_i128, &bps, &100_u64,
+    );
+    assert_eq!(root, 0);
+
+    // floor gives 33/33/33 (=99) with 1 leftover unit; the largest remainder
+    // (33.34%) earns it, so shares are 34/33/33 and sum to exactly 100.
+    assert_eq!(client.get_stream(&0_u64).total_amount, 34_i128);
+    assert_eq!(client.get_stream(&1_u64).total_amount, 33_i128);
+    assert_eq!(client.get_stream(&2_u64).total_amount, 33_i128);
+    assert_eq!(token_client.balance(&contract_id), 100);
+    assert_eq!(token_client.balance(&sender), FUNDING - 100);
+}
+
+#[test]
+fn cancel_split_bps_refunds_correctly() {
+    let (env, client, contract_id, token, sender, _receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    let bps = vec![&env, 2_500_u32, 7_500_u32];
+
+    let root = client.create_split_stream_bps(
+        &sender, &receivers, &token, &10_000_i128, &bps, &100_u64,
+    );
+    env.ledger().set_timestamp(START + 50);
+
+    // 50% vested → refund 50% of 10,000 = 5,000; receivers keep 2,500 / 7,500.
+    let refund = client.cancel_split(&sender, &root);
+    assert_eq!(refund, 5_000_i128);
+    assert_eq!(token_client.balance(&r1), 1_250);
+    assert_eq!(token_client.balance(&r2), 3_750);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(token_client.balance(&sender), FUNDING - 5_000);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #18)")] // Error::InvalidAllocation
+fn split_bps_rejects_non_100_percent() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    let bps = vec![&env, 5_000_u32, 4_999_u32]; // sums to 9,999
+    client.create_split_stream_bps(&sender, &receivers, &token, &1_000_i128, &bps, &100_u64);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #18)")] // Error::InvalidAllocation
+fn split_bps_rejects_zero_weight() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    let bps = vec![&env, 10_000_u32, 0_u32];
+    client.create_split_stream_bps(&sender, &receivers, &token, &1_000_i128, &bps, &100_u64);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #18)")] // Error::InvalidAllocation
+fn split_bps_rejects_total_too_small() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    // 0.01% of 2 base units rounds to 0 for the first receiver.
+    let bps = vec![&env, 1_u32, 9_999_u32];
+    client.create_split_stream_bps(&sender, &receivers, &token, &2_i128, &bps, &100_u64);
+}
+
+// ---- Integer-percentage splits (sums to 100) -------------------------------
+
+#[test]
+fn create_split_stream_pct_allocates_exact_shares() {
+    let (env, client, contract_id, token, sender, _receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    let pcts = vec![&env, 30_u32, 70_u32];
+
+    let root = client.create_split_stream_pct(
+        &sender, &receivers, &token, &1_000_i128, &pcts, &100_u64,
+    );
+    assert_eq!(root, 0);
+
+    // 30% / 70% of 1,000 → 300 and 700 exactly.
+    assert_eq!(client.get_stream(&0_u64).total_amount, 300_i128);
+    assert_eq!(client.get_stream(&1_u64).total_amount, 700_i128);
+    assert_eq!(token_client.balance(&contract_id), 1_000);
+    assert_eq!(token_client.balance(&sender), FUNDING - 1_000);
+}
+
+#[test]
+fn split_pct_rounds_dust_without_loss_or_gain() {
+    let (env, client, contract_id, token, sender, _receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone(), r3.clone()];
+    let pcts = vec![&env, 33_u32, 33_u32, 34_u32];
+
+    let root = client.create_split_stream_pct(
+        &sender, &receivers, &token, &10_i128, &pcts, &100_u64,
+    );
+    assert_eq!(root, 0);
+
+    // floor(3.3/3.3/3.4) = 3/3/3 (=9); the 1 leftover unit goes to the 34%
+    // receiver (largest remainder), so shares are 3/3/4 and sum to 10.
+    assert_eq!(client.get_stream(&0_u64).total_amount, 3_i128);
+    assert_eq!(client.get_stream(&1_u64).total_amount, 3_i128);
+    assert_eq!(client.get_stream(&2_u64).total_amount, 4_i128);
+    assert_eq!(token_client.balance(&contract_id), 10);
+    assert_eq!(token_client.balance(&sender), FUNDING - 10);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #18)")] // Error::InvalidAllocation
+fn split_pct_rejects_non_100() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    let pcts = vec![&env, 50_u32, 49_u32]; // sums to 99
+    client.create_split_stream_pct(&sender, &receivers, &token, &1_000_i128, &pcts, &100_u64);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #18)")] // Error::InvalidAllocation
+fn split_pct_rejects_zero_weight() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    let pcts = vec![&env, 100_u32, 0_u32];
+    client.create_split_stream_pct(&sender, &receivers, &token, &1_000_i128, &pcts, &100_u64);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #18)")] // Error::InvalidAllocation
+fn split_pct_rejects_total_too_small() {
+    let (env, client, _contract_id, token, sender, _receiver) = setup();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let receivers = vec![&env, r1.clone(), r2.clone()];
+    // 1% of 2 base units rounds to 0 for the first receiver.
+    let pcts = vec![&env, 1_u32, 99_u32];
+    client.create_split_stream_pct(&sender, &receivers, &token, &2_i128, &pcts, &100_u64);
 }
