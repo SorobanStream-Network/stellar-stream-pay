@@ -197,15 +197,22 @@ app.get("/api/account/:address", async (req, res) => {
 // RPC has no websocket push yet) and fold each event into their own
 // stream-state cache instead of scanning storage ids.
 const EVENT_KINDS = ["created", "withdraw", "cancelled"];
-// `getEvents` filters topics by base64-encoded ScVal strings; match any of the
-// three kind symbols in topic position 0.
-const EVENT_TOPICS_FILTER = [
-  EVENT_KINDS.map((k) => nativeToScVal(k, { type: "symbol" }).toXDR("base64")),
-];
+// `getEvents` matches topics via a list of filters, each an array of
+// SegmentMatchers ("*" = one topic, "**" = one-or-more topics, or a base64
+// ScVal for an exact match). A `#[contractevent]` publishes its name
+// ("stream_event") as topic[0] and the `#[topic]` fields after it, so the kind
+// symbol lives at topic[1]. We OR one filter per kind and let "**" swallow the
+// trailing stream_id/sender/receiver topics.
+const EVENT_TOPICS_FILTER = EVENT_KINDS.map((k) => [
+  nativeToScVal("stream_event", { type: "symbol" }).toXDR("base64"),
+  nativeToScVal(k, { type: "symbol" }).toXDR("base64"),
+  "**",
+]);
 
 /** Decode one raw RPC event into a plain, JSON-safe object. */
 function decodeEvent(e) {
-  const [kind, streamId, sender, receiver] = e.topic.map(scValToNative);
+  // Topics: [event_name, kind, stream_id, sender, receiver].
+  const [, kind, streamId, sender, receiver] = e.topic.map(scValToNative);
   // Map-format event value: { token, amount, start_time, end_time }.
   const value = scValToNative(e.value);
   return {
@@ -228,9 +235,12 @@ function decodeEvent(e) {
  * returning at most `limit` (≤ 100) matching events plus the pagination
  * cursor for the next page.
  */
-async function queryContractEvents(startLedger = 0, limit = 100) {
-  const res = await rpc.getEvents({
-    startLedger,
+async function queryContractEvents({ startLedger, cursor, limit = 100 }) {
+  // Soroban RPC's `getEvents` scans a bounded number of ledgers per request
+  // (~10k), so a wide default range can silently return no results even when
+  // matching events exist. Default to a recent ~1000-ledger window (~83 min)
+  // when neither a cursor nor an explicit startLedger is supplied.
+  const params = {
     filters: [
       {
         type: "contract",
@@ -239,7 +249,18 @@ async function queryContractEvents(startLedger = 0, limit = 100) {
       },
     ],
     limit: Math.min(limit, 100),
-  });
+  };
+  if (cursor) {
+    params.cursor = cursor;
+  } else {
+    if (startLedger === undefined) {
+      const latest = await rpc.getLatestLedger();
+      const WINDOW = 1000;
+      startLedger = latest.sequence > WINDOW ? latest.sequence - WINDOW : 1;
+    }
+    params.startLedger = startLedger;
+  }
+  const res = await rpc.getEvents(params);
   return {
     events: res.events.map(decodeEvent),
     cursor: res.cursor,
@@ -248,16 +269,31 @@ async function queryContractEvents(startLedger = 0, limit = 100) {
 }
 
 // Recent lifecycle events (`created` / `withdraw` / `cancelled`) for the
-// contract. Page with `?startLedger=<n>` or the returned `cursor`.
+// contract. Page with `?cursor=<n>` (from a previous response) or query a
+// ledger range with `?startLedger=<n>`.
 app.get("/api/events", async (req, res) => {
   if (!STREAM_CONTRACT_ID) {
     return res.status(400).json({ error: "STREAM_CONTRACT_ID is not configured on the server." });
   }
-  const startLedger = Number(req.query.startLedger ?? 0);
+  const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
+  const startLedger = req.query.startLedger === undefined
+    ? undefined
+    : Number(req.query.startLedger);
   const limit = Number(req.query.limit ?? 100);
+  if (cursor && startLedger !== undefined) {
+    return res.status(400).json({ error: "Use either `cursor` or `startLedger`, not both." });
+  }
+  // Soroban RPC requires startLedger >= 1 (ledgers are 1-indexed).
+  if (startLedger !== undefined && (!Number.isInteger(startLedger) || startLedger < 1)) {
+    return res.status(400).json({ error: "startLedger must be a positive integer" });
+  }
   try {
-    const { events, cursor, latestLedger } = await queryContractEvents(startLedger, limit);
-    res.json({ contract: STREAM_CONTRACT_ID, count: events.length, cursor, latestLedger, events });
+    const { events, cursor: nextCursor, latestLedger } = await queryContractEvents({
+      startLedger,
+      cursor,
+      limit,
+    });
+    res.json({ contract: STREAM_CONTRACT_ID, count: events.length, cursor: nextCursor, latestLedger, events });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
