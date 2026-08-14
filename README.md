@@ -43,6 +43,9 @@ Contracts (SAC) and custom tokens.
 
 ## Architecture
 
+> Full C4-style system diagrams (context, containers, key flows) live in
+> [docs/architecture.md](docs/architecture.md).
+
 ```text
                           ┌─────────────────────────────┐
                           │       Employer (sender)     │

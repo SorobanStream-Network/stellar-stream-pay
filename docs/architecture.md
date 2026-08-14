@@ -53,7 +53,7 @@ The system is split into three deployable containers plus the on-chain contract.
 ```mermaid
 flowchart LR
     subgraph repo["Repository (monorepo)"]
-        CORE["contracts/core<br/>stream-core v1<br/>(Rust, #![no_std])"]
+        CORE["contracts/core<br/>stream-core v1<br/>(Rust, no_std)"]
         API["backend<br/>Express indexer<br/>(Node 20, ESM)"]
         DAPP["frontend<br/>React + Vite<br/>(Freighter)"]
     end
@@ -138,7 +138,7 @@ sequenceDiagram
     S->>C: create_stream(sender, receiver, token, amount, duration)
     C->>C: require_auth(sender); validate inputs
     C->>C: write Stream + Counter (CEI)
-    C->>T: transfer(sender → contract, amount)
+    C->>T: transfer(sender -> contract, amount)
     C->>C: assert balance delta == amount (fee-on-transfer guard)
     C-->>S: stream_id; emit StreamEvent(created)
 ```
