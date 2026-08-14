@@ -29,6 +29,15 @@ use soroban_sdk::{
     symbol_short, token, Address, Env, Symbol,
 };
 
+/// The frozen public API version of the stream core.
+///
+/// The core is intentionally small and immutable: its interface is pinned at
+/// v1 and must not change. Any breaking change to the function signatures
+/// below is a migration event (redeploy + reindex) and requires a version
+/// bump. New capabilities belong in *extension* contracts that compose this
+/// core, never inside it.
+pub const STREAM_CORE_API_VERSION: u32 = 1;
+
 /// Persistent-storage keys.
 #[contracttype]
 #[derive(Clone)]
@@ -303,6 +312,12 @@ impl StreamingContract {
     }
 
     // ---- Views (read-only) ------------------------------------------------
+
+    /// The pinned API version of this contract. SDKs and indexers use it to
+    /// detect the interface they are talking to.
+    pub fn version(_env: Env) -> u32 {
+        STREAM_CORE_API_VERSION
+    }
 
     /// Pro-rata linearly-vested amount as of the current ledger time.
     /// For a cancelled stream, vesting is frozen at `cancelled_at`.

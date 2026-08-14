@@ -1,0 +1,23 @@
+[package]
+name = "stream-core"
+version = "1.0.0"
+edition = "2021"
+description = "Frozen core for linearly-vesting payment streams on Stellar (Soroban)."
+license = "Apache-2.0"
+publish = false
+
+# Contracts compile to a Wasm module (wasm32v1-none) via `stellar contract build`.
+# Do NOT build with `cargo build` — stellar-cli applies the required target and
+# build settings. See the root README.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = "27.0.6"
+
+[dev-dependencies]
+soroban-sdk = { version = "27.0.6", features = ["testutils"] }
+proptest = "1"
+
+[features]
+testutils = ["soroban-sdk/testutils"]

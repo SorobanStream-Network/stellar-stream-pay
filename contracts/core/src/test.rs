@@ -10,6 +10,7 @@ use soroban_sdk::{
 };
 use soroban_sdk::xdr::{Limits, ScVal, WriteXdr};
 use soroban_sdk::testutils::storage::Persistent as _;
+use proptest::prelude::*;
 
 // ---- Mock SEP-41 token --------------------------------------------------
 //
@@ -140,6 +141,91 @@ fn nothing_before_start() {
 fn floors_fractional_amounts() {
     // 100 / 3 ≈ 33.3 per second; after 1s the floored accrual is 33.
     assert_eq!(vested_amount(100, 0, 3, 1), 33);
+}
+
+// ---- Property-based tests (proptest) --------------------------------------
+//
+// `vested_amount` is a pure function, so its correctness can be checked with
+// randomized inputs across thousands of cases — no `Env`, so no snapshot churn.
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+
+    #[test]
+    fn vested_amount_is_bounded(
+        total in 0i128..10_000_000i128,
+        start in 0u64..10_000u64,
+        len in 1u64..10_000u64,
+        now in 0u64..30_000u64,
+    ) {
+        let end = start + len;
+        let v = vested_amount(total, start, end, now);
+        prop_assert!(v >= 0);
+        prop_assert!(v <= total);
+    }
+
+    #[test]
+    fn vested_amount_is_monotonic_in_time(
+        total in 1i128..10_000_000i128,
+        start in 0u64..10_000u64,
+        len in 1u64..10_000u64,
+        now in 0u64..20_000u64,
+        delta in 0u64..10_000u64,
+    ) {
+        let end = start + len;
+        let now2 = now.saturating_add(delta);
+        prop_assert!(
+            vested_amount(total, start, end, now2) >= vested_amount(total, start, end, now)
+        );
+    }
+
+    #[test]
+    fn vested_amount_is_exact_floor_division(
+        total in 1i128..10_000_000i128,
+        start in 0u64..10_000u64,
+        len in 1u64..10_000u64,
+        now in 0u64..30_000u64,
+    ) {
+        let end = start + len;
+        let v = vested_amount(total, start, end, now);
+        let t = if now < end { now } else { end };
+        let elapsed = t.saturating_sub(start) as i128;
+        let duration = (end - start) as i128;
+        // v == floor(total * elapsed / duration)  ⇔
+        //   v * duration <= total * elapsed < (v + 1) * duration
+        prop_assert!(v * duration <= total * elapsed);
+        prop_assert!((v + 1) * duration > total * elapsed);
+    }
+
+    #[test]
+    fn vested_amount_endpoints_are_exact(
+        total in 1i128..10_000_000i128,
+        start in 0u64..10_000u64,
+        len in 1u64..10_000u64,
+    ) {
+        let end = start + len;
+        prop_assert_eq!(vested_amount(total, start, end, start), 0);
+        prop_assert_eq!(vested_amount(total, start, end, end), total);
+        // Past the end it clamps to the full amount.
+        prop_assert_eq!(vested_amount(total, start, end, end + len), total);
+    }
+
+    #[test]
+    fn vested_amount_distributes_across_split(
+        a in 1i128..1_000_000i128,
+        b in 1i128..1_000_000i128,
+        start in 0u64..10_000u64,
+        len in 1u64..10_000u64,
+        now in 0u64..30_000u64,
+    ) {
+        let end = start + len;
+        let v_ab = vested_amount(a + b, start, end, now);
+        let v_a = vested_amount(a, start, end, now);
+        let v_b = vested_amount(b, start, end, now);
+        // Flooring can lose at most one base unit across the split.
+        prop_assert!(v_ab >= v_a + v_b);
+        prop_assert!(v_ab <= v_a + v_b + 1);
+    }
 }
 
 // ---- Integration: mock token + create/withdraw/cancel round-trips -------
@@ -302,6 +388,92 @@ fn multiple_streams_are_independent() {
     let w0 = client.withdraw(&receiver, &id0);
     assert_eq!(w0, 1_000_i128);
     assert_eq!(client.get_withdrawable(&id1), 1_000_i128);
+}
+
+// ---- Settlement invariant --------------------------------------------------
+//
+// The core's safety property: at every point in a stream's life the vested,
+// withdrawn, and unvested portions partition the locked total, and after a
+// cancel the vested remainder goes to the receiver while the unvested
+// remainder returns to the sender — no tokens created or destroyed.
+
+#[test]
+fn settlement_invariant_holds_across_scenarios() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    // (amount, duration, withdraw_offset, cancel_offset) — a grid spanning
+    // partial/full withdrawals, cancellation with/without a prior withdrawal,
+    // tiny amounts (flooring), and large/long streams.
+    let scenarios: &[(i128, u64, Option<u64>, Option<u64>)] = &[
+        (1_000, 100, Some(50), None),               // partial withdraw, active
+        (1_000, 100, Some(200), None),              // withdraw after end (full)
+        (1_000, 100, Some(25), Some(75)),           // partial then cancel
+        (1_000, 100, None, Some(50)),               // cancel, no prior withdraw
+        (1_000, 100, Some(50), Some(50)),           // withdraw + cancel same instant
+        (1, 100, Some(100), None),                  // tiny amount, full vest
+        (3, 2, Some(1), None),                      // fractional floors down
+        (10_000_000, 10_000, Some(9_999), None),    // large, long-running
+        (1_000, 100, None, None),                   // active, no action
+    ];
+
+    for (i, (amount, duration, w_off, c_off)) in scenarios.iter().enumerate() {
+        let t0 = START + (i as u64) * 100_000;
+        env.ledger().set_timestamp(t0);
+        let id = client.create_stream(&sender, &receiver, &token, amount, duration);
+
+        if let Some(off) = w_off {
+            env.ledger().set_timestamp(t0 + off);
+            client.withdraw(&receiver, &id);
+        }
+
+        if let Some(off) = c_off {
+            env.ledger().set_timestamp(t0 + off);
+            let refund = client.cancel(&sender, &id);
+            let s = client.get_stream(&id);
+            // Vested → receiver (recorded as `withdrawn`), unvested → sender
+            // (returned as `refund`). Nothing is created or lost.
+            assert_eq!(
+                s.total_amount,
+                s.withdrawn + refund,
+                "scenario {i}: total != withdrawn + refund"
+            );
+            assert_eq!(
+                client.get_withdrawable(&id),
+                0_i128,
+                "scenario {i}: withdrawable != 0 after cancel"
+            );
+        } else {
+            let s = client.get_stream(&id);
+            let accrued = client.streamed_amount(&id);
+            let withdrawable = client.get_withdrawable(&id);
+            assert!(
+                s.withdrawn <= accrued && accrued <= s.total_amount,
+                "scenario {i}: withdrawn/accrued out of order"
+            );
+            assert_eq!(
+                withdrawable,
+                accrued - s.withdrawn,
+                "scenario {i}: withdrawable != accrued - withdrawn"
+            );
+        }
+    }
+
+    // Conservation of tokens across every scenario: nothing minted or burned.
+    let sender_bal = token_client.balance(&sender);
+    let receiver_bal = token_client.balance(&receiver);
+    let contract_bal = token_client.balance(&contract_id);
+    assert_eq!(
+        sender_bal + receiver_bal + contract_bal,
+        FUNDING,
+        "tokens created or destroyed across scenarios"
+    );
+}
+
+#[test]
+fn version_reports_pinned_api_version() {
+    let (_env, client, _contract_id, _token, _sender, _receiver) = setup();
+    assert_eq!(client.version(), 1_u32);
 }
 
 // ---- Authorization-tree assertions ----------------------------------------

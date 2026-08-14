@@ -11,7 +11,7 @@ fixes to historical tags.
 | Version   | Supported          |
 |-----------|--------------------|
 | `main`    | :white_check_mark: |
-| < 0.1.0   | :x:                |
+| < 1.0.0   | :x:                |
 
 ## Reporting a vulnerability
 
@@ -30,7 +30,7 @@ fixes to historical tags.
 
 A good report lets us reproduce and fix quickly. Please include:
 
-- **Component & version** — the affected file/feature (e.g. `contracts/src/lib.rs`,
+- **Component & version** — the affected file/feature (e.g. `contracts/core/src/lib.rs`,
   `backend/src/index.js`, `frontend/src/lib/soroban.ts`) and the commit or tag.
 - **Description** — the nature of the issue (fund loss, auth bypass, DoS, …).
 - **Steps to reproduce** — a minimal test case, contract call, or transaction sequence.
@@ -49,7 +49,7 @@ A good report lets us reproduce and fix quickly. Please include:
 
 **In scope**
 
-- `contracts/` — the Soroban streaming contract and its tests.
+- `contracts/core/` — the frozen `stream-core` streaming contract and its tests.
 - `backend/` — the Express indexer / API.
 - `frontend/` — the React + Freighter DApp.
 

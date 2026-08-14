@@ -76,7 +76,7 @@ Contracts (SAC) and custom tokens.
 
 ### How the pieces fit together
 
-- **Contract** (`contracts/`) — holds locked funds and enforces the linear vesting
+- **Contract** (`contracts/core/`) — holds locked funds and enforces the linear vesting
   schedule. Emits `created`, `withdrawn`, and `cancelled` events for indexers.
 - **Backend** (`backend/`) — Express API that reads contract storage directly via
   Soroban RPC (`getContractData`) and classic balances via Horizon, serving the
@@ -90,6 +90,12 @@ Contracts (SAC) and custom tokens.
 - 🔐 **Soroban smart contract** — `#![no_std]`, strict `require_auth()` on every
   actor, check-effects-interactions ordering, overflow-checked arithmetic, and a
   complete unit/integration test suite with authorization-tree assertions.
+- 🧊 **Frozen core, composable extensions** — `stream-core` (API v1) is small,
+  auditable, and immutable; future capabilities (splits, schedules, payroll) ship
+  as separate contracts that *compose* the core rather than extending it.
+- 🧪 **Property-based invariant tests** — `proptest` randomizes the vesting math
+  across thousands of cases, and a settlement-invariant test proves no tokens are
+  created or destroyed across create/withdraw/cancel scenarios.
 - ⛓️ **SAC & SEP-41 native** — streams any token through the standard token
   interface; no separate mint/clawback/admin logic.
 - 🗂️ **Node indexer / API** — reads live stream state from Soroban RPC and account
@@ -103,11 +109,13 @@ Contracts (SAC) and custom tokens.
 
 ```text
 stellar-stream-pay/
-├── contracts/              # Rust / Soroban smart contract
-│   ├── src/lib.rs          #   create_stream, withdraw, cancel + views
-│   ├── src/test.rs         #   unit + integration tests (mock SAC token)
-│   ├── Cargo.toml          #   soroban-sdk, cdylib crate, release profile
-│   └── test_snapshots/     #   committed SDK snapshot tests
+├── contracts/              # Rust / Soroban contracts (Cargo workspace)
+│   ├── Cargo.toml          #   workspace root + release profile
+│   └── core/               #   frozen stream-core primitive (API v1)
+│       ├── src/lib.rs      #     create_stream, withdraw, cancel + views
+│       ├── src/test.rs     #     unit, integration, property & invariant tests
+│       ├── Cargo.toml      #     stream-core package (soroban-sdk, proptest)
+│       └── test_snapshots/ #     committed SDK snapshot tests
 ├── backend/                # Node.js / Express indexer & API
 │   └── src/index.js        #   reads stream state from Soroban RPC + Horizon
 ├── frontend/               # React / Vite DApp with Freighter wallet
@@ -146,13 +154,13 @@ node --version       # >= 20
 ### 1. Build, test & deploy the contract
 
 ```bash
-cd contracts
+cd contracts/core
 
-# Compile to target/wasm32v1-none/release/stellar_stream_pay.wasm.
+# Compile to ../target/wasm32v1-none/release/stream_core.wasm.
 # Always use `stellar contract build` (never plain `cargo build`).
 stellar contract build
 
-# Run the vesting-math + integration + auth-tree unit tests.
+# Run the vesting-math + integration + property-based invariant tests.
 cargo test
 ```
 
@@ -161,7 +169,7 @@ Upload (install) the Wasm, then deploy an instance on Testnet:
 ```bash
 # Install the compiled Wasm; prints a hex wasm hash.
 stellar contract upload \
-  --wasm target/wasm32v1-none/release/stellar_stream_pay.wasm \
+  --wasm ../target/wasm32v1-none/release/stream_core.wasm \
   --network testnet
 
 # Deploy an instance from that hash; prints the contract id (C...).
@@ -222,6 +230,7 @@ With the backend running (`VITE_BACKEND_URL`):
 | `streamed_amount(stream_id) -> i128` | — | Current vested amount (pro-rata). |
 | `get_withdrawable(stream_id) -> i128` | — | Amount currently available to withdraw. |
 | `get_stream_count() -> u64` | — | Total streams ever created. |
+| `version() -> u32` | — | Pinned core API version. |
 
 ### Storage layout (for indexers)
 
@@ -260,6 +269,8 @@ Defaults target **Testnet**. For Mainnet, switch `RPC_URL`, `HORIZON_URL`,
 
 - [x] Core linearly-vesting stream contract (`create` / `withdraw` / `cancel` + views + events)
 - [x] Unit, integration, and authorization-tree tests with committed snapshots
+- [x] Property-based invariant tests (proptest) + settlement-invariant suite
+- [x] `stream-core` v1 extracted to `contracts/core/` as a frozen, composable workspace member
 - [x] Express indexer / API (Soroban RPC + Horizon)
 - [x] React + Freighter dashboard (connect, create, withdraw, cancel)
 - [ ] **Split streams** — fan one stream out to multiple receivers

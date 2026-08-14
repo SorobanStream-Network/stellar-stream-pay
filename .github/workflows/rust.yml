@@ -36,10 +36,10 @@ jobs:
           workspaces: contracts
 
       - name: Check (host target)
-        run: cargo check
+        run: cargo check -p stream-core
 
       - name: Test
-        run: cargo test
+        run: cargo test -p stream-core
 
       - name: Build (Soroban Wasm target)
-        run: cargo build --target wasm32v1-none --release
+        run: cargo build -p stream-core --target wasm32v1-none --release

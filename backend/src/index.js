@@ -35,7 +35,7 @@ app.use(express.json());
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Storage layout mirror (must match contracts/src/lib.rs `DataKey`):
+// Storage layout mirror (must match contracts/core/src/lib.rs `DataKey`):
 //   * counter -> DataKey::Counter        == scvVec([scvSymbol("Counter")])
 //   * stream  -> DataKey::Stream(u64 id) == scvVec([scvSymbol("Stream"), scvU64(id)])
 // A `#[contracttype]` enum serializes as a Vec with a leading Symbol
