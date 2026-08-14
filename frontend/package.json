@@ -2,6 +2,7 @@
   "name": "stellar-stream-pay-frontend",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
   "description": "StellarStream-Pay dashboard — connect Freighter, manage streams, trigger withdrawals.",
   "type": "module",
   "scripts": {

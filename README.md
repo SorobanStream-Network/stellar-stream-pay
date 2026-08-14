@@ -8,7 +8,7 @@
 self-custodial, and denominated in any SEP-41 asset (including SAC-wrapped XLM,
 USDC, EURC, …).*
 
-![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Soroban SDK](https://img.shields.io/badge/soroban--sdk-27.0.6-7c5cff)
 ![Rust](https://img.shields.io/badge/rust-1.84%2B-orange.svg)
 ![Network](https://img.shields.io/badge/network-testnet-3bd0c9)
@@ -309,4 +309,4 @@ Defaults target **Testnet**. For Mainnet, switch `RPC_URL`, `HORIZON_URL`,
 
 ## License
 
-[Apache-2.0](LICENSE) © StellarStream-Pay contributors.
+[MIT](LICENSE) © StellarStream-Pay contributors.

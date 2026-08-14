@@ -3,7 +3,7 @@ name = "stream-core"
 version = "1.0.0"
 edition = "2021"
 description = "Frozen core for linearly-vesting payment streams on Stellar (Soroban)."
-license = "Apache-2.0"
+license = "MIT"
 publish = false
 
 # Contracts compile to a Wasm module (wasm32v1-none) via `stellar contract build`.

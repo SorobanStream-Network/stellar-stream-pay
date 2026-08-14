@@ -2,6 +2,7 @@
   "name": "stellar-stream-pay-backend",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Express indexer & API for StellarStream-Pay — reads stream state from Soroban RPC and account balances from Horizon.",
   "type": "module",
   "main": "src/index.js",
