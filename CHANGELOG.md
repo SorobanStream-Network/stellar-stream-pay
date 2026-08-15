@@ -23,6 +23,17 @@ frontend follow the contract's interface.
   to the contract cap), and falls back to per-stream `bump` calls when a
   batch fails (e.g. the deployed contract predates `bump_many` or the batch
   exceeds the per-tx footprint), so streams are never left un-re-armed.
+- **Event-based backend indexer** — `backend/src/indexer.js` maintains an
+  in-memory index of stream state by seeding once (storage scan, or pure event
+  backfill from `INDEX_START_LEDGER`) and polling the contract's
+  `created`/`withdrawn`/`cancelled` (+ `split_created`) events forward;
+  `/api/streams` and `/api/stream/:address` are served from the index instead
+  of scanning storage ids `0..count` per request. Cancelled streams freeze at
+  the folded vested-at-freeze amount; the raw event stream stays queryable via
+  `/api/events`. `INDEX_POLL_MS` / `INDEX_START_LEDGER` env vars.
+- **Contract overflow hardening** — the release profile now sets
+  `overflow-checks = true` (contract `Cargo.toml`), making the documented
+  "overflow traps, never wraps" guarantee true in release wasm builds.
 - **Keeper monitoring** — every pass emits a structured one-line JSON status
   (`ok`, `streams`/`due`/`covered`/`instanceBumped`, `failed`, `durationMs`)
   for log shippers, and the scheduler serves `GET /health` (liveness) and

@@ -81,9 +81,11 @@ Contracts (SAC) and custom tokens.
 
 - **Contract** (`contracts/core/`) — holds locked funds and enforces the linear vesting
   schedule. Emits `created`, `withdrawn`, and `cancelled` events for indexers.
-- **Backend** (`backend/`) — Express API that reads contract storage directly via
-  Soroban RPC (`getContractData`) and classic balances via Horizon, serving the
-  frontend with decorated stream data (`accrued`, `withdrawable`, `progress`).
+- **Backend** (`backend/`) — Express API that maintains an in-memory index of
+  stream state from the contract's `created`/`withdrawn`/`cancelled` events
+  (seed + `getEvents` poll; see `backend/src/indexer.js`), plus Horizon classic
+  balances, serving the frontend with decorated stream data (`accrued`,
+  `withdrawable`, `progress`).
 - **Frontend** (`frontend/`) — Freighter wallet integration; builds, simulates,
   assembles, signs, and submits `create_stream` / `withdraw` / `cancel`
   transactions with `@stellar/stellar-sdk`.
@@ -362,8 +364,19 @@ The backend reads both directly via RPC `getContractData`.
 - **Authorization** — `create_stream`, `withdraw`, and `cancel` each call
   `require_auth()` on the acting party; token pulls/pushes flow through the
   SEP-41 `token::Client`, which enforces its own auth.
+- **Input guards** — `InvalidDuration` rejects `duration_seconds == 0` *before*
+  any storage write (no divide-by-zero in vesting math); `InvalidAmount` rejects
+  non-positive amounts; `InvalidParties` rejects sender == receiver; a missing
+  stream id returns `StreamNotFound` and a second `withdraw` on a fully-drawn
+  stream returns `NothingToWithdraw` / `StreamCancelled` — clean `Error` codes,
+  never panics.
 - **Check-effects-interactions** — stream state is updated *before* external token
-  calls, and arithmetic overflow traps (rather than wraps) via `overflow-checks = true`.
+  calls, and arithmetic overflow traps (rather than wraps) via
+  `overflow-checks = true` in the release profile (contract `Cargo.toml`).
+- **Circuit breaker (pause)** — the deploy-time constructor binds a single,
+  never-re-settable admin address. `pause`/`unpause` (admin-authed) gate NEW
+  stream creation only; `withdraw` and `cancel` never consult the flag, so
+  receivers keep unconditional access to already-vested funds during a pause.
 - **SAC compatibility** — transfers use the standard SEP-41 `token::Client`, which
   works for SAC-wrapped native assets and custom tokens alike. The admin-only
   `token::StellarAssetClient` (mint/clawback) is intentionally unused.
@@ -376,9 +389,10 @@ The backend reads both directly via RPC `getContractData`.
 - **Rent bumping** — `create`/`withdraw`/`cancel`/`bump`/`bump_many`/`bump_instance` extend
   the persistent entries *and* the contract instance/code TTL to the network
   maximum, so neither streams nor the vault are archived mid-term.
-- **Indexer scaling** — the backend scans stream ids `0..count` for simplicity. For
-  large fleets, index the contract's `created` / `withdrawn` / `cancelled` events
-  instead (see `StreamEvent`).
+- **Indexer scaling** — the backend maintains an in-memory index of stream state
+  by seeding once and polling the contract's `created` / `withdrawn` / `cancelled`
+  events (`getEvents`) forward, so `/api/streams` and `/api/stream/:address` are
+  served from the index instead of scanning storage ids `0..count` per request.
 
 See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
 
@@ -398,9 +412,10 @@ point at the same network as `VITE_RPC_URL`), and `VITE_NETWORK_PASSPHRASE`
 - [x] `stream-core` v1 extracted to `contracts/core/` as a frozen, composable workspace member
 - [x] Express indexer / API (Soroban RPC + Horizon)
 - [x] React + Freighter dashboard (connect, create, withdraw, cancel)
-- [ ] **Split streams** — fan one stream out to multiple receivers
+- [x] **Split streams** — fan one stream out to multiple receivers (`create_split_stream` / `_bps` / `_pct`, `cancel_split`, `get_split`)
 - [ ] **Dependency streams** — payer → sub-payee chains (multi-tier payroll)
-- [ ] Event-based indexing (replace the id-scan with `created`/`withdrawn`/`cancelled` events)
+- [x] Event-based indexing — backend folds `created`/`withdrawn`/`cancelled` (+ split) events into an in-memory index (`/api/streams`, `/api/stream/:address`) instead of the per-request id-scan
+- [x] TTL keeper relayer — permissionless `bump`/`bump_many`/`bump_instance` on a schedule, with pass status + Prometheus metrics
 - [ ] Token metadata display (symbol + decimals) in the dashboard
 - [ ] Relayer / gasless withdrawals for receivers
 - [ ] Mainnet deployment + third-party audit
