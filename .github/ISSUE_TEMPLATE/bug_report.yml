@@ -1,0 +1,51 @@
+name: Bug report
+description: Something isn't working — contract, backend, frontend, or tooling
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One bug per issue. Include enough to reproduce before labeling as ready.
+  - type: input
+    id: component
+    attributes:
+      label: Component
+      description: Contract / Backend / Frontend / Tooling / CI
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the full error message / decoded error text, not a summary.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Network (testnet/mainnet), contract id, accounts, exact commands or UI steps.
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Who is affected and how badly (funds at risk, blocked users, cosmetic).
+    validations:
+      required: true
+  - type: textarea
+    id: fix_idea
+    attributes:
+      label: Proposed fix (optional)
+      description: Pointer to the likely file/function and approach.

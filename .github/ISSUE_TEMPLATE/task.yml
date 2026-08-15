@@ -1,0 +1,58 @@
+name: Engineering task
+description: A scoped, closable engineering task (contract, backend, frontend, ops, docs, tests)
+title: "[task]: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One issue = one scoped, closable task. If this describes more than one
+        deliverable, split it. All fields are required before this issue is
+        ready for sprint planning.
+  - type: input
+    id: category
+    attributes:
+      label: Category
+      description: Smart Contracts / Backend / Frontend UX / Security / Testing / Documentation / Ops
+    validations:
+      required: true
+  - type: input
+    id: priority
+    attributes:
+      label: Priority
+      description: High (blocks the wave submission) / Medium / Low
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description & Context
+      description: Why this needs to be done. Reference files/functions when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria / Definition of Done
+      description: Falsifiable checklist items — each must be verifiable by a reviewer (exact commands, thresholds, named alternatives).
+      placeholder: |
+        - [ ] ...specific and verifiable...
+    validations:
+      required: true
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of scope
+      description: What this issue explicitly does NOT include (split those into their own issues).
+  - type: textarea
+    id: verify
+    attributes:
+      label: How to verify
+      description: Exact commands / steps a reviewer runs to confirm the acceptance criteria.
+    validations:
+      required: true
+  - type: input
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Issue numbers this depends on (e.g. #1, #3), or "none".
