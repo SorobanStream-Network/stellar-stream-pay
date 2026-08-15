@@ -83,11 +83,21 @@ Persistent storage is keyed through the `DataKey` enum (`#[contracttype]`):
 |-----|-------|---------|
 | `DataKey::Counter` | `u64` | Monotonic stream-id counter |
 | `DataKey::Stream(u64)` | `Stream` | Metadata for stream `id` |
+| `DataKey::Admin` | `Address` | Immutable pause admin, set at construction |
+| `DataKey::Paused` | `bool` | Circuit breaker for new stream creation |
+| `DataKey::Split(u64)` | `SplitGroup` | Split-group index for root stream `id` |
 
 A `Stream` records `sender`, `receiver`, `token`, `total_amount`, `start_time`,
 `end_time`, `withdrawn`, `cancelled`, and `cancelled_at`. Amounts are `i128`
 (base units; stroops for SAC assets) and time is ledger-close time (unix
 seconds).
+
+**TTL / leases.** Every persistent entry is TTL-bumped to the network maximum
+on write, and the contract **instance + Wasm code** entries — which are
+*separate* ledger entries — are re-armed on every lifecycle write and via the
+permissionless keepers `bump(stream_id)` and `bump_instance()`. If either the
+instance or the code entry were archived, the contract could no longer be
+invoked at all, so this is what keeps a long-running (or idle) vault alive.
 
 ### 3.2 Lifecycle events
 
@@ -195,8 +205,10 @@ while the ecosystem grows around it.
   arithmetic overflow rather than wrapping.
 - **Fee-on-transfer rejection** — `create_stream` verifies the contract actually
   received exactly `amount`, rejecting non-conforming tokens.
-- **TTL management** — persistent entries are TTL-bumped on write so long-running
-  streams are not archived mid-term.
+- **TTL management** — persistent entries are TTL-bumped on write, and the
+  contract instance + code entries are re-armed on every lifecycle write and by
+  the permissionless keepers (`bump` / `bump_many` / `bump_instance`), so neither long-running
+  streams nor the vault itself are ever archived mid-term.
 - **Trust boundary** — the contract trusts the *behavior* of the token it is
   asked to stream. A token that lies about its own balance can only underpay
   itself; real deployments should stream SAC or allow-listed tokens.

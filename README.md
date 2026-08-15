@@ -107,6 +107,15 @@ Contracts (SAC) and custom tokens.
   amounts, and cancel streams from a clean dashboard.
 - 📡 **Lifecycle events** — `created` / `withdrawn` / `cancelled` topics for
   event-based indexing and notifications.
+- 🔋 **Rent-bumped leases** — persistent entries, the contract instance, and the
+  Wasm code all have their TTL re-armed to the network maximum on every
+  lifecycle write and via permissionless keepers (`bump` / `bump_many` /
+  `bump_instance`), so
+  long-running streams and an idle vault are never archived.
+- 🛡️ **Pre-flight + decoded errors** — every wallet action is validated (wallet
+  ready, gas, token balance, receiver trustline) *before* the Freighter dialog,
+  and raw Soroban `HostError`/contract codes are decoded into human-readable
+  messages.
 
 ## Repository layout
 
@@ -124,9 +133,12 @@ stellar-stream-pay/
 │   └── Dockerfile          #   container image
 ├── frontend/               # React / Vite DApp with Freighter wallet
 │   ├── src/App.tsx         #   dashboard: view/manage streams, trigger actions
-│   ├── src/lib/soroban.ts  #   wallet + transaction helpers
+│   ├── src/lib/stellar/    #   wallet, rpc, tx, error-decoding, pre-flight helpers
+│   ├── src/lib/contracts/  #   stream-core client (invoke + TTL keepers)
 │   └── Dockerfile          #   multi-stage build + nginx serve
 ├── docs/                   # architecture & design docs
+│   ├── architecture.md     #   C4 system design
+│   └── architecture-refactor.md  #   modular /sdk decoupling blueprint
 ├── .github/workflows/      # CI (contract, backend, frontend, PR title lint)
 ├── docker-compose.yml      # local orchestration (backend + frontend)
 ├── CONTRIBUTING.md         # development workflow & conventions
@@ -242,6 +254,86 @@ Serves the backend on `http://localhost:4000` and the frontend (with
 `VITE_CONTRACT_ID` baked in at build time) on `http://localhost:8080`. All env
 vars have Testnet defaults — see the `.env.example` files.
 
+### 5. Run the TTL keeper (relayer)
+
+`stream-core` v4's permissionless `bump` / `bump_many` / `bump_instance`
+entrypoints re-arm the contract instance, Wasm code, and stream entries so
+they are never archived while holding funds — but someone has to call them.
+`backend/src/keeper.js` is a scheduled relayer that does exactly that:
+
+- every pass sends `bump_instance()` once (re-arms the instance + code +
+  admin/pause config + id counter),
+- reads every stream entry's remaining TTL via RPC and sends `bump_many([ids])`
+  — chunked into `KEEPER_BUMP_BATCH`-sized batches (default 4) — only for
+  streams below the threshold (default 30 days), so a fleet pays one tx per
+  batch per pass and gas spend tracks need. If a batch fails (the deployed
+  contract predates `bump_many`, or the batch exceeds the per-tx footprint)
+  it falls back to per-stream `bump` calls, so nothing is ever left un-re-armed.
+
+It needs a **funded keeper account** — any account works, the calls only pay
+gas. Run it as a long-lived process, or once per cron tick:
+
+```bash
+KEEPER_SECRET=S... npm run keeper                # scheduler (daily by default)
+KEEPER_SECRET=S... npm run keeper:once           # single pass, for cron
+KEEPER_SECRET=S... npm run keeper -- --dry-run   # plan only, sends nothing
+```
+
+Or as a Compose service (enabled by setting `KEEPER_SECRET`):
+
+```bash
+KEEPER_SECRET=S... docker compose up -d keeper
+```
+
+Tune with `KEEPER_INTERVAL_MIN` (pass cadence, default 1440 = daily),
+`KEEPER_TTL_THRESHOLD` (bump streams below this remaining TTL, in ledgers —
+518,400 ledgers ≈ 30 days), `KEEPER_BUMP_BATCH` (stream ids per `bump_many`
+call, clamped to the contract's cap of 32; default 4), and
+`NETWORK_PASSPHRASE`. See `backend/.env.example` for all variables.
+
+#### Monitoring the keeper
+
+Every pass emits one machine-parseable JSON line on stdout, so log shippers
+(Loki, Datadog, ELK) can alert on it directly:
+
+```json
+{"event":"keeper_pass","ts":"…","ok":true,"streams":2,"due":2,"covered":2,"instanceBumped":true,"dryRun":false,"failed":[],"durationMs":123}
+```
+
+Alert when `ok` is false, `failed` is non-empty, or `covered < due`.
+
+In scheduler mode the keeper also serves a tiny health endpoint
+(`KEEPER_HEALTH_PORT`, default 4300; `0` disables):
+
+- `GET /health` — liveness: the process is up.
+- `GET /status` — last pass result (`ok`, counts, failures, `durationMs`),
+  `nextPassInSec`, and `lastError` when a pass failed outright. The endpoint
+  reports `"degraded"` after a failed pass.
+- `GET /metrics` — Prometheus text-format exposition for scrapers
+  (Prometheus, Grafana, VictoriaMetrics): monotonic counters
+  (`stream_core_keeper_passes_total`, `_pass_failures_total`,
+  `_bumps_total`, `_batches_total`, `_failures_total`) and last-pass gauges
+  (`_last_pass_timestamp_seconds`, `_last_pass_ok`,
+  `_last_pass_duration_seconds`, `_streams`, `_due_streams`,
+  `_covered_streams`, `_instance_bumped`, `_up`). Counters accumulate across
+  passes; gauges reflect the most recent pass. A fresh process emits zeroed
+  series so alerting rules work from the first scrape.
+
+`docker compose up -d keeper` runs a `healthcheck` against `/health`, so
+`docker compose ps` shows the keeper's health. For k8s readiness probes, set
+`KEEPER_HEALTH_HOST=0.0.0.0`.
+
+**Grafana alerting.** Point a Prometheus scrape at
+`http://<keeper-host>:4300/metrics` (publish `KEEPER_HEALTH_PORT` on the
+container, or scrape the host directly) and alert on:
+
+- `stream_core_keeper_last_pass_ok == 0` — the most recent pass failed;
+- `increase(stream_core_keeper_failures_total[1h]) > 0` — actions are failing;
+- a stalled keeper: `increase(stream_core_keeper_bumps_total[7d]) == 0` while
+  `stream_core_keeper_due_streams > 0` — streams are expiring and nothing is
+  re-arming them;
+- liveness: `up{job="stream-core-keeper"} == 0` after scraping the job.
+
 ## Contract API
 
 | Function | Auth | Description |
@@ -254,6 +346,9 @@ vars have Testnet defaults — see the `.env.example` files.
 | `get_withdrawable(stream_id) -> i128` | — | Amount currently available to withdraw. |
 | `get_stream_count() -> u64` | — | Total streams ever created. |
 | `version() -> u32` | — | Pinned core API version. |
+| `bump(stream_id)` | — | Permissionless keeper: re-arms the stream entry's TTL lease (and the instance/code lease). |
+| `bump_many(stream_ids)` | — | Permissionless keeper, batched: re-arms several streams (≤ `MAX_BUMP_BATCH` = 32) in one transaction; atomic — a missing id reverts the whole batch. |
+| `bump_instance()` | — | Permissionless keeper: re-arms the contract instance + code TTL so an idle vault is never archived. |
 
 ### Storage layout (for indexers)
 
@@ -275,6 +370,12 @@ The backend reads both directly via RPC `getContractData`.
 - **Frontend signing** — transactions are simulated + assembled via
   `prepareTransaction` (so auth entries and footprints are correct) before Freighter
   signs; the app never touches private keys.
+- **Pre-flight validation** — wallet readiness, gas, token balance, and receiver
+  trustlines are checked before the wallet dialog; simulation and submission
+  errors are decoded into readable messages (`decodeSorobanError`).
+- **Rent bumping** — `create`/`withdraw`/`cancel`/`bump`/`bump_many`/`bump_instance` extend
+  the persistent entries *and* the contract instance/code TTL to the network
+  maximum, so neither streams nor the vault are archived mid-term.
 - **Indexer scaling** — the backend scans stream ids `0..count` for simplicity. For
   large fleets, index the contract's `created` / `withdrawn` / `cancelled` events
   instead (see `StreamEvent`).
@@ -284,9 +385,10 @@ See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
 ## Networks
 
 Defaults target **Testnet**. For Mainnet, switch `RPC_URL`, `HORIZON_URL`,
-`VITE_RPC_URL`, and `VITE_NETWORK_PASSPHRASE`
+`VITE_RPC_URL`, `VITE_HORIZON_URL` (pre-flight balance/trustline checks must
+point at the same network as `VITE_RPC_URL`), and `VITE_NETWORK_PASSPHRASE`
 (`Public Global Stellar Network ; September 2015`) and deploy with
-`--network mainnet`.
+`--network mainnet`. `VITE_MIN_GAS_XLM` is optional (defaults to 1 XLM).
 
 ## Roadmap
 
@@ -308,6 +410,7 @@ Defaults target **Testnet**. For Mainnet, switch `RPC_URL`, `HORIZON_URL`,
 - [CONTRIBUTING.md](CONTRIBUTING.md) — development workflow, testing, and commit/PR conventions.
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community guidelines.
 - [docs/architecture.md](docs/architecture.md) — system architecture (C4-style diagrams).
+- [docs/architecture-refactor.md](docs/architecture-refactor.md) — modular `/sdk` decoupling blueprint.
 - [CHANGELOG.md](CHANGELOG.md) — version history.
 
 ## License

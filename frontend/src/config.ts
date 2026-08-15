@@ -14,4 +14,15 @@ export const CONFIG = {
     (import.meta.env.VITE_NETWORK_PASSPHRASE as string) || Networks.TESTNET,
   backendUrl:
     (import.meta.env.VITE_BACKEND_URL as string) || "http://localhost:4000",
+  /** Classic-account balance lookups for pre-flight gas/trustline checks. */
+  horizonUrl:
+    (import.meta.env.VITE_HORIZON_URL as string) ||
+    "https://horizon-testnet.stellar.org",
+  /**
+   * Coarse XLM floor (in XLM) that pre-flight requires for Soroban fees.
+   * The real cost comes from the transaction simulation (`minResourceFee` +
+   * inclusion fee); this is only a cheap "obviously broke" gate so users are
+   * warned before the wallet dialog. Override with VITE_MIN_GAS_XLM.
+   */
+  minGasXlm: Number(import.meta.env.VITE_MIN_GAS_XLM ?? 1),
 };

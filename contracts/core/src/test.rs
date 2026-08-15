@@ -2,14 +2,14 @@
 // library (needed for `std::vec::Vec` in the auth-tree assertions).
 extern crate std;
 
-use super::{vested_amount, DataKey, SplitEvent, StreamEvent, StreamingContract, StreamingContractClient, STREAM_CORE_API_VERSION, MAX_SPLIT_MEMBERS};
+use super::{vested_amount, DataKey, SplitEvent, StreamEvent, StreamingContract, StreamingContractClient, STREAM_CORE_API_VERSION, MAX_BUMP_BATCH, MAX_SPLIT_MEMBERS};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Event,
     testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Events, Ledger as _},
     token, Address, Env, IntoVal, Symbol, Vec,
 };
 use soroban_sdk::xdr::{Limits, ScVal, WriteXdr};
-use soroban_sdk::testutils::storage::Persistent as _;
+use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
 use proptest::prelude::*;
 
 // ---- Mock SEP-41 token --------------------------------------------------
@@ -917,6 +917,179 @@ fn bump_re_arms_counter_ttl() {
     });
     let max = env.as_contract(&contract_id, || env.storage().max_ttl());
     assert_eq!(after, max, "bump must re-arm the id counter to max, got {after}");
+}
+
+// ---- Contract instance + code TTL (rent-bumping the lease) -----------------
+//
+// The contract instance and its Wasm code are ledger entries SEPARATE from the
+// persistent data. If either is archived the contract can no longer be invoked
+// at all — every locked stream is stranded. So the constructor, every lifecycle
+// write, and the permissionless keepers must re-arm the instance/code TTL.
+
+#[test]
+fn constructor_sets_instance_ttl_to_max() {
+    let (env, _client, contract_id, _token, _sender, _receiver) = setup();
+
+    // A freshly deployed contract must carry the maximum instance/code TTL so
+    // it cannot be archived while idle.
+    let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    assert_eq!(ttl, max, "instance TTL {ttl} != max {max} after construction");
+}
+
+#[test]
+fn bump_bumps_contract_instance_ttl() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+
+    // Drift the instance entry toward expiry — a contract kept alive only by
+    // stream-scoped `bump` calls for longer than one TTL window.
+    let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    env.ledger().set_sequence_number(env.ledger().sequence() + ttl - 100);
+
+    client.bump(&0_u64);
+
+    let after = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    assert_eq!(after, max, "bump must restore instance TTL to max, got {after}");
+}
+
+#[test]
+fn bump_instance_extends_idle_contract_ttl() {
+    // No streams exist, so `bump(stream_id)` cannot be called (StreamNotFound)
+    // — but the instance/code entries still need re-arming or a fully idle
+    // contract is archived and can never be invoked again. `bump_instance`
+    // must work on a fresh deployment with no auth.
+    let (env, client, contract_id, _token, _sender, _receiver) = setup();
+
+    let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    env.ledger().set_sequence_number(env.ledger().sequence() + ttl - 100);
+
+    client.bump_instance();
+
+    let after = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    assert_eq!(after, max, "bump_instance must restore instance TTL to max, got {after}");
+}
+
+#[test]
+fn lifecycle_ops_bump_contract_instance_ttl() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    let stream_id = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+
+    // Any mutating op must restore a drifting instance TTL to max.
+    let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    env.ledger().set_sequence_number(env.ledger().sequence() + ttl - 100);
+
+    env.ledger().set_timestamp(START + 50);
+    client.withdraw(&receiver, &stream_id);
+
+    let after = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    assert_eq!(after, max, "withdraw must restore instance TTL to max, got {after}");
+}
+
+// ---- Batched keeper calls (v4: bump_many) ---------------------------------
+//
+// Large fleets should pay ONE transaction per pass instead of one per stream,
+// so `bump_many` re-arms several streams plus the shared entries in a single
+// call. It is permissionless (like `bump`), atomic (a missing id reverts the
+// whole batch), and bounded by `MAX_BUMP_BATCH`.
+
+#[test]
+fn bump_many_re_arms_streams_and_shared_entries_in_one_call() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    let id0 = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+    let id1 = client.create_stream(&sender, &receiver, &token, &2_000_i128, &100_u64);
+    let id2 = client.create_stream(&sender, &receiver, &token, &3_000_i128, &100_u64);
+
+    // Drift every stream, the counter, and the instance toward expiry.
+    let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    env.ledger().set_sequence_number(env.ledger().sequence() + ttl - 100);
+
+    client.bump_many(&vec![&env, id0, id1, id2]);
+
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    for id in [id0, id1, id2] {
+        let stream_ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&DataKey::Stream(id))
+        });
+        assert_eq!(stream_ttl, max, "bump_many must restore stream {id} TTL to max");
+    }
+    let counter_ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Counter)
+    });
+    assert_eq!(counter_ttl, max, "bump_many must restore the counter TTL to max");
+    let instance_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(instance_ttl, max, "bump_many must restore the instance TTL to max");
+}
+
+#[test]
+fn bump_many_reverts_atomically_on_missing_stream() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    let id0 = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+
+    let ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Stream(id0))
+    });
+    env.ledger().set_sequence_number(env.ledger().sequence() + ttl - 100);
+
+    // id 99 does not exist -> the WHOLE batch must revert (StreamNotFound),
+    // not silently re-arm the valid ids and leave the caller misinformed.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.bump_many(&vec![&env, id0, 99_u64]);
+    }));
+    assert!(res.is_err(), "bump_many with a missing id must panic");
+
+    // Atomicity: stream 0 must NOT have been re-armed by the failed call.
+    let after = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Stream(id0))
+    });
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    assert!(
+        after < max,
+        "failed bump_many must leave stream 0's TTL untouched (atomic revert), got {after}"
+    );
+}
+
+#[test]
+fn bump_many_re_arms_split_group_entries_for_roots() {
+    let (env, client, contract_id, token, sender, _receiver) = setup();
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let root = client.create_split_stream(
+        &sender,
+        &vec![&env, r1, r2],
+        &token,
+        &vec![&env, 400_i128, 600_i128],
+        &100_u64,
+    );
+
+    let ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Split(root))
+    });
+    env.ledger().set_sequence_number(env.ledger().sequence() + ttl - 100);
+
+    client.bump_many(&vec![&env, root]);
+
+    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    let split_ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Split(root))
+    });
+    assert_eq!(split_ttl, max, "bump_many must re-arm split-group entries for roots");
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #20)")] // Error::BatchTooLarge
+fn bump_many_rejects_too_large_batch() {
+    let (env, client, _contract_id, _token, _sender, _receiver) = setup();
+    // Duplicate ids are fine for the size check — it fires before any load,
+    // so no stream needs to exist.
+    let mut ids: Vec<u64> = Vec::new(&env);
+    for _ in 0..(MAX_BUMP_BATCH + 1) {
+        ids.push_back(0_u64);
+    }
+    client.bump_many(&ids);
 }
 
 // ---- Admin pause (Stage 3) ------------------------------------------------

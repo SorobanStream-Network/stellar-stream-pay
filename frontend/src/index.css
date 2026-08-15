@@ -136,6 +136,6 @@ body {
   transition: width 0.3s ease;
 }
 
-.banner { border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; font-size: 0.9rem; }
+.banner { border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; font-size: 0.9rem; white-space: pre-line; }
 .banner.error { background: rgba(255, 92, 122, 0.12); border: 1px solid rgba(255, 92, 122, 0.4); color: #ffb3c1; }
 .banner.success { background: rgba(47, 191, 113, 0.12); border: 1px solid rgba(47, 191, 113, 0.4); color: #a8eec6; }

@@ -18,6 +18,43 @@ services:
     ports:
       - "4000:4000"
 
+  # Permissionless TTL keeper / relayer: periodically re-arms the stream-core
+  # instance + code lease (`bump_instance`) and per-stream leases (`bump_many`,
+  # falling back to `bump`) so ledger entries are never archived while holding
+  # funds. Requires a funded
+  # keeper account — any account works, the calls only pay gas. Start it with
+  # KEEPER_SECRET set (e.g. `KEEPER_SECRET=S... docker compose up -d keeper`);
+  # without a secret the process fails fast with a clear message.
+  keeper:
+    build:
+      context: ./backend
+    command: ["node", "src/keeper.js"]
+    environment:
+      RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      NETWORK_PASSPHRASE: ${NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
+      STREAM_CONTRACT_ID: ${STREAM_CONTRACT_ID:-}
+      KEEPER_SECRET: ${KEEPER_SECRET:-}
+      KEEPER_INTERVAL_MIN: ${KEEPER_INTERVAL_MIN:-1440}
+      KEEPER_TTL_THRESHOLD: ${KEEPER_TTL_THRESHOLD:-518400}
+      KEEPER_HEALTH_PORT: ${KEEPER_HEALTH_PORT:-4300}
+      KEEPER_HEALTH_HOST: ${KEEPER_HEALTH_HOST:-127.0.0.1}
+    # `docker compose ps` / `docker inspect` report healthy once a pass has
+    # been recorded; /status shows the last pass result and any failures, and
+    # /metrics exposes Prometheus counters/gauges for Grafana alerting.
+    # Publish KEEPER_HEALTH_PORT (e.g. `ports: ["4300:4300"]`) to scrape it.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4300/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
   frontend:
     build:
       context: ./frontend

@@ -47,10 +47,15 @@ use soroban_sdk::{
 ///
 /// FIX (Finding 2): v1 was the original create/withdraw/cancel/views surface.
 /// v2 adds the deploy-time `admin` constructor argument, `pause`/`unpause`,
-/// `bump`, the `get_split` view, and the split-stream entrypoints. Any further
-/// breaking change to the function signatures below is a migration event
-/// (redeploy + reindex) and requires another version bump.
-pub const STREAM_CORE_API_VERSION: u32 = 2;
+/// `bump`, the `get_split` view, and the split-stream entrypoints. v3 adds the
+/// permissionless `bump_instance` keeper entrypoint and extends the contract
+/// instance + Wasm code TTL on every lifecycle write (see `bump_instance_ttl`)
+/// so a long-lived contract can never be archived mid-term. v4 adds the
+/// batched `bump_many` keeper entrypoint so a relayer can re-arm many streams
+/// in one transaction (large fleets pay one tx per pass instead of one per
+/// stream). Any further breaking change to the function signatures below is a
+/// migration event (redeploy + reindex) and requires another version bump.
+pub const STREAM_CORE_API_VERSION: u32 = 4;
 
 /// Upper bound on the number of receivers in a single split stream.
 /// FIX (Finding 4): one storage entry + one event are written per member, so
@@ -58,6 +63,15 @@ pub const STREAM_CORE_API_VERSION: u32 = 2;
 /// per-transaction ledger-entry/event/gas limits. Also bounds the O(n·dust)
 /// dust pass in `split_by_weights` (Finding 5) to negligible cost.
 pub const MAX_SPLIT_MEMBERS: u32 = 32;
+
+/// Upper bound on the number of stream ids in a single `bump_many` call.
+/// FIX (Finding 4, same rationale as `MAX_SPLIT_MEMBERS`): each id extends one
+/// stream entry (+ its split-group entry when the id is a group root), so an
+/// unbounded vector could exceed Soroban's per-transaction footprint limits.
+/// The tx would revert anyway, but rejecting the bad input cheaply and up
+/// front keeps keepers honest. Keepers should chunk large fleets into batches
+/// of this size or smaller.
+pub const MAX_BUMP_BATCH: u32 = 32;
 
 /// Persistent-storage keys.
 #[contracttype]
@@ -182,6 +196,7 @@ pub enum Error {
     SplitAmountOverflow = 17,
     InvalidAllocation = 18,
     SplitTooManyReceivers = 19,
+    BatchTooLarge = 20,
 }
 
 #[contract]
@@ -208,6 +223,11 @@ impl StreamingContract {
         // relying on `is_paused()`'s absent->false default.
         env.storage().persistent().set(&DataKey::Paused, &false);
         Self::bump_ttl_max(&env, &DataKey::Paused);
+        // FIX (Finding 9 / TTL timebomb): arm the contract instance + Wasm code
+        // TTL to max at deploy. These are separate ledger entries from the
+        // persistent data — if either is archived the contract can no longer be
+        // invoked at all and every locked stream is stranded.
+        Self::bump_instance_ttl(&env);
     }
 
     /// Create a stream. `sender` must sign this call and, in the same
@@ -288,6 +308,10 @@ impl StreamingContract {
         // archived mid-term (persistent entries expire after `max_ttl`).
         Self::bump_ttl(&env, &DataKey::Stream(stream_id));
         Self::bump_ttl(&env, &DataKey::Counter);
+        // FIX (Finding 9): every lifecycle write re-arms the contract instance
+        // + code TTL too, so the vault itself can never be archived while it
+        // holds funds.
+        Self::bump_instance_ttl(&env);
 
         StreamEvent {
             kind: symbol_short!("created"),
@@ -518,6 +542,8 @@ impl StreamingContract {
             member_ids.push_back(stream_id);
         }
         Self::bump_ttl(env, &DataKey::Counter);
+        // FIX (Finding 9): re-arm the contract instance + code TTL.
+        Self::bump_instance_ttl(env);
         let root_id = member_ids.first().unwrap();
 
         env.storage().persistent().set(
@@ -609,6 +635,8 @@ impl StreamingContract {
         // FIX (Finding 1): keep the id counter alive alongside the stream so a
         // long-idle contract can never reuse stream ids.
         Self::bump_ttl(&env, &DataKey::Counter);
+        // FIX (Finding 9): re-arm the contract instance + code TTL.
+        Self::bump_instance_ttl(&env);
 
         // Pay out. The contract is the `from`; the token contract's own
         // `require_auth` for the contract address is satisfied because this
@@ -668,6 +696,8 @@ impl StreamingContract {
         Self::bump_ttl(&env, &DataKey::Stream(stream_id));
         // FIX (Finding 1): keep the id counter alive alongside the stream.
         Self::bump_ttl(&env, &DataKey::Counter);
+        // FIX (Finding 9): re-arm the contract instance + code TTL.
+        Self::bump_instance_ttl(&env);
 
         // FIX (Finding 3): verify each outbound transfer delivers the exact
         // amount, so a fee-on-transfer token can't short the receiver or the
@@ -784,6 +814,8 @@ impl StreamingContract {
             Self::transfer_out_exact(&env, &group.token, &sender, total_refund);
         }
         Self::bump_ttl(&env, &DataKey::Split(root_id));
+        // FIX (Finding 9): re-arm the contract instance + code TTL.
+        Self::bump_instance_ttl(&env);
 
         total_refund
     }
@@ -796,6 +828,8 @@ impl StreamingContract {
         env.storage().persistent().set(&DataKey::Paused, &true);
         Self::bump_ttl(&env, &DataKey::Paused);
         Self::bump_ttl(&env, &DataKey::Admin);
+        // FIX (Finding 9): re-arm the contract instance + code TTL.
+        Self::bump_instance_ttl(&env);
     }
 
     /// Resume new stream creation. Only the admin may call this.
@@ -804,6 +838,8 @@ impl StreamingContract {
         env.storage().persistent().set(&DataKey::Paused, &false);
         Self::bump_ttl(&env, &DataKey::Paused);
         Self::bump_ttl(&env, &DataKey::Admin);
+        // FIX (Finding 9): re-arm the contract instance + code TTL.
+        Self::bump_instance_ttl(&env);
     }
 
     /// Whether new stream creation is currently paused (view).
@@ -821,8 +857,7 @@ impl StreamingContract {
     /// performing a mutating action. (`DataKey::Counter` is kept alive by
     /// `create_stream` itself, which bumps it on every creation.)
     pub fn bump(env: Env, stream_id: u64) {
-        Self::load(&env, stream_id); // validates existence (StreamNotFound otherwise)
-        Self::bump_ttl(&env, &DataKey::Stream(stream_id));
+        Self::bump_stream_entry(&env, stream_id);
         // FIX (Finding 1): keep the id counter alive alongside streams so a
         // long-idle contract can never wrap `next_id` back to 0 and overwrite
         // a live stream. (Counter exists whenever at least one stream exists.)
@@ -840,11 +875,65 @@ impl StreamingContract {
         if env.storage().persistent().has(&DataKey::Paused) {
             Self::bump_ttl(&env, &DataKey::Paused);
         }
-        // FIX (Stage 5): if this stream is the root of a split group, also
-        // re-arm the group entry so `cancel_split` can't silently expire while
-        // members are kept alive. Guarded: `extend_ttl` on a missing key panics.
-        if env.storage().persistent().has(&DataKey::Split(stream_id)) {
-            Self::bump_ttl(&env, &DataKey::Split(stream_id));
+        // FIX (Finding 9): re-arm the contract instance + code TTL so the
+        // vault can never be archived while any stream is alive.
+        Self::bump_instance_ttl(&env);
+    }
+
+    /// Keep several streams' storage entries alive in ONE transaction, so a
+    /// relayer serving a large fleet pays one tx per pass instead of one per
+    /// stream. Permissionless, exactly like `bump` — it changes nothing but
+    /// TTLs. The shared entries (counter, admin/pause, instance + code) are
+    /// re-armed once for the whole batch.
+    ///
+    /// Validation is atomic: every id is loaded first, so a missing/archived
+    /// stream reverts the entire batch (`StreamNotFound`) rather than leaving
+    /// a partial re-arm that could mislead keepers into thinking a stream was
+    /// kept alive. Bound the batch with [`MAX_BUMP_BATCH`] (`BatchTooLarge`).
+    pub fn bump_many(env: Env, stream_ids: Vec<u64>) {
+        if stream_ids.len() > MAX_BUMP_BATCH {
+            panic_with_error!(&env, Error::BatchTooLarge);
+        }
+        // Pass 1: validate every id before touching any entry (check-effects-
+        // interactions). Soroban transactions revert atomically anyway, but
+        // this fails before any work and keeps the intent explicit.
+        for i in 0..stream_ids.len() {
+            Self::load(&env, stream_ids.get(i).unwrap());
+        }
+        // Pass 2: re-arm each stream entry (and split-group entry for roots).
+        for i in 0..stream_ids.len() {
+            Self::bump_stream_entry(&env, stream_ids.get(i).unwrap());
+        }
+        // Shared entries, once for the whole batch.
+        Self::bump_ttl(&env, &DataKey::Counter);
+        if env.storage().persistent().has(&DataKey::Admin) {
+            Self::bump_ttl(&env, &DataKey::Admin);
+        }
+        if env.storage().persistent().has(&DataKey::Paused) {
+            Self::bump_ttl(&env, &DataKey::Paused);
+        }
+        Self::bump_instance_ttl(&env);
+    }
+
+    /// Extend the contract INSTANCE + Wasm code TTL to the network maximum,
+    /// permissionless. Unlike `bump(stream_id)` this needs no stream id, so a
+    /// keeper can re-arm a freshly deployed (or fully settled) contract whose
+    /// instance would otherwise be archived while idle — after the instance
+    /// entry expires the contract can never be invoked again, stranding any
+    /// funds it still holds.
+    ///
+    /// FIX (Finding 9): also re-arms the admin/pause config and the id counter
+    /// when present (guarded — `extend_ttl` on a missing key panics).
+    pub fn bump_instance(env: Env) {
+        Self::bump_instance_ttl(&env);
+        if env.storage().persistent().has(&DataKey::Admin) {
+            Self::bump_ttl(&env, &DataKey::Admin);
+        }
+        if env.storage().persistent().has(&DataKey::Paused) {
+            Self::bump_ttl(&env, &DataKey::Paused);
+        }
+        if env.storage().persistent().has(&DataKey::Counter) {
+            Self::bump_ttl(&env, &DataKey::Counter);
         }
     }
 
@@ -951,12 +1040,46 @@ impl StreamingContract {
         shares
     }
 
+    /// Re-arm one stream entry's lease to the network maximum, plus its
+    /// split-group entry when this id is a group root. Shared by the `bump`
+    /// and `bump_many` entrypoints so the two never drift apart.
+    /// FIX (Stage 5): re-arming the root's `Split` entry keeps `cancel_split`
+    /// from silently expiring while members are kept alive. Guarded:
+    /// `extend_ttl` on a missing key panics.
+    fn bump_stream_entry(env: &Env, stream_id: u64) {
+        Self::load(env, stream_id); // validates existence (StreamNotFound otherwise)
+        Self::bump_ttl(env, &DataKey::Stream(stream_id));
+        if env.storage().persistent().has(&DataKey::Split(stream_id)) {
+            Self::bump_ttl(env, &DataKey::Split(stream_id));
+        }
+    }
+
     /// FIX (Finding 7): extend a persistent entry's TTL all the way to the
     /// network maximum. Used for one-shot config entries (`Admin`, `Paused`)
     /// that have no natural re-arm path and must survive a fully idle contract.
     fn bump_ttl_max(env: &Env, key: &DataKey) {
         let max = env.storage().max_ttl();
         env.storage().persistent().extend_ttl(key, max, max);
+    }
+
+    /// FIX (Finding 9 / TTL timebomb): extend the contract INSTANCE and Wasm
+    /// CODE TTL to the network maximum. The instance and code are two ledger
+    /// entries *separate* from the persistent data — if either is archived the
+    /// contract can no longer be invoked at all and every locked stream is
+    /// stranded. Re-armed on every lifecycle write and via the permissionless
+    /// keepers (`bump` / `bump_instance`) so a long-lived contract is never
+    /// archived mid-term.
+    ///
+    /// `env.storage().instance().extend_ttl(threshold, extend_to)` extends both
+    /// the current contract's instance entry and its code entry; `extend_ttl`
+    /// is a no-op when the current TTL already exceeds `extend_to`, so a
+    /// threshold just below `max_ttl` means "re-arm whenever the entry is not
+    /// at the ceiling" with negligible cost.
+    fn bump_instance_ttl(env: &Env) {
+        let max = env.storage().max_ttl();
+        env.storage()
+            .instance()
+            .extend_ttl(max.saturating_sub(1), max);
     }
 
     /// FIX: extend a persistent entry's TTL so long-running streams don't get
