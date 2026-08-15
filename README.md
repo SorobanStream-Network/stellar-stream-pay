@@ -103,8 +103,9 @@ Contracts (SAC) and custom tokens.
   created or destroyed across create/withdraw/cancel scenarios.
 - ⛓️ **SAC & SEP-41 native** — streams any token through the standard token
   interface; no separate mint/clawback/admin logic.
-- 🗂️ **Node indexer / API** — reads live stream state from Soroban RPC and account
-  balances from Horizon, with computed accrual/withdrawable/progress.
+- 🗂️ **Node indexer / API** — maintains an in-memory index of stream state from
+  the contract's lifecycle events (seed + `getEvents` poll), plus Horizon account
+  balances, with computed accrual/withdrawable/progress.
 - ⚛️ **React + Freighter DApp** — connect wallet, create streams, withdraw accrued
   amounts, and cancel streams from a clean dashboard.
 - 📡 **Lifecycle events** — `created` / `withdrawn` / `cancelled` topics for
@@ -131,7 +132,9 @@ stellar-stream-pay/
 │       ├── Cargo.toml      #     stream-core package (soroban-sdk, proptest)
 │       └── test_snapshots/ #     committed SDK snapshot tests
 ├── backend/                # Node.js / Express indexer & API
-│   ├── src/index.js        #   reads stream state from Soroban RPC + Horizon
+│   ├── src/index.js        #   API routes (served from the event index)
+│   ├── src/indexer.js      #   in-memory event index (seed + getEvents poll)
+│   ├── src/keeper.js       #   TTL relayer: bump / bump_many / bump_instance
 │   └── Dockerfile          #   container image
 ├── frontend/               # React / Vite DApp with Freighter wallet
 │   ├── src/App.tsx         #   dashboard: view/manage streams, trigger actions
@@ -395,6 +398,39 @@ The backend reads both directly via RPC `getContractData`.
   served from the index instead of scanning storage ids `0..count` per request.
 
 See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
+
+## Testing
+
+The repo is verified at every layer — CI (`.github/workflows/`) runs all of
+this on every push:
+
+**Contract (`cargo test -p stream-core` from `contracts/`) — 66 tests:**
+
+- **Vesting math** — property tests (`proptest`) randomize the time-weighted
+  accrual formula across thousands of cases (`vested_amount_is_bounded`,
+  `_is_monotonic_in_time`, `_is_exact_floor_division`, `_endpoints_are_exact`).
+- **Integration** — create → partial/full withdraw → cancel round trips with
+  exact pro-rata payouts; the settlement-invariant test proves sender refund +
+  receiver payouts always sum to exactly `total_amount` (no value created or
+  destroyed) across every scenario.
+- **Authorization tree** — unauthorized callers are rejected at every entrypoint
+  (`withdraw_rejects_non_receiver`, `cancel_rejects_uninvolved_party`,
+  `pause_requires_admin_auth`).
+- **Edge cases** — zero amount/duration, sender == receiver, double-cancel,
+  nothing-to-withdraw, fee-on-transfer tokens, TTL re-arming, pause gating,
+  and split-stream bounds.
+- Committed SDK snapshots (`test_snapshots/`) pin exact storage/event behavior.
+
+**Backend (`cd backend && npm test`) — 23 tests (`node:test`, zero new deps):**
+
+- **TTL keeper** — `bump_many` batching with per-stream fallback, dry-run,
+  per-item error isolation, archived-entry skipping.
+- **Monitoring** — health/status endpoints and Prometheus metrics accumulation.
+- **Event indexer** — fold/seed/backfill/poll semantics and enrich math.
+
+**Frontend (`cd frontend && npx tsc -b`) — typechecks clean**, and the error
+decoder smoke tests cover every contract code, host failure, Freighter
+rejection, and network error shape.
 
 ## Networks
 
