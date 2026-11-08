@@ -1,4 +1,11 @@
 #![no_std]
+// Contract entrypoints are the public ABI: their parameter lists are dictated by
+// the on-chain interface (`create_stream_scheduled` adds two options to the v1
+// `create_stream` call), and the internal split helpers mirror those signatures.
+// The argument count cannot be reduced without changing the interface callers
+// depend on, so the lint is allowed crate-wide rather than per function (the
+// `#[contractimpl]` macro would otherwise re-report it at its own span).
+#![allow(clippy::too_many_arguments)]
 
 //! StellarStream-Pay — continuous streaming payments on Stellar (Soroban).
 //!
@@ -394,10 +401,7 @@ impl StreamingContract {
             Some(t) => t,
             None => panic_with_error!(&env, Error::InvalidDuration),
         };
-        let cliff_secs = match cliff_seconds {
-            Some(c) => c,
-            None => 0,
-        };
+        let cliff_secs = cliff_seconds.unwrap_or_default();
         if cliff_secs > duration_seconds {
             panic_with_error!(&env, Error::InvalidCliff);
         }
