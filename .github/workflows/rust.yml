@@ -66,3 +66,15 @@ jobs:
 
       - name: Build (Soroban Wasm, optimized)
         run: stellar contract build
+
+      # Publish the deployable artifact so a deploy job (or a human) picks up
+      # exactly the Wasm this run produced instead of rebuilding locally.
+      # `path` is repo-root-relative: the job-level `defaults.run
+      # .working-directory` applies to `run:` steps only, not to `uses:`.
+      - name: Upload Wasm artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: stream-core-wasm
+          path: contracts/target/wasm32v1-none/release/stream_core.wasm
+          if-no-files-found: error
+          retention-days: 14
