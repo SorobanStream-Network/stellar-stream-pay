@@ -1,4 +1,4 @@
-import { groupDigits, short } from "../../lib/format";
+import { formatWhen, groupDigits, short } from "../../lib/format";
 import type { Stream } from "../../types";
 import { Button } from "../ui/Button";
 import { Meter } from "../ui/Meter";
@@ -24,12 +24,17 @@ export function StreamCard({
   onCancel: (stream: Stream) => void;
 }) {
   const outgoing = stream.sender === walletAddress;
-  // A cancelled stream is still claimable by the receiver for the portion
-  // that vested before cancellation.
+  // A cancelled stream is already settled on-chain, so `withdrawable` is 0.
   const canWithdraw =
     stream.receiver === walletAddress && BigInt(stream.withdrawable) > 0n;
   // Senders may cancel an active stream and reclaim the unvested remainder.
   const canCancel = stream.sender === walletAddress && !stream.cancelled;
+  // A cliff gates the unlock: nothing accrues until `cliff_time`. The contract
+  // stores `cliff_time == start_time` for streams with no cliff.
+  const cliffSeconds = Number(stream.cliff_time);
+  const hasCliff = Number.isFinite(cliffSeconds) && cliffSeconds > Number(stream.start_time);
+  const locked =
+    hasCliff && !stream.cancelled && Date.now() / 1000 < cliffSeconds;
 
   return (
     <li className={`card ${stream.cancelled ? "cancelled" : ""}`}>
@@ -57,12 +62,24 @@ export function StreamCard({
         <span className="muted">Withdrawable</span>
         <span>{groupDigits(stream.withdrawable)}</span>
       </div>
+      {hasCliff && (
+        <div className="row">
+          <span className="muted">Cliff</span>
+          <span>
+            {locked
+              ? `Locked until ${formatWhen(stream.cliff_time)}`
+              : formatWhen(stream.cliff_time)}
+          </span>
+        </div>
+      )}
       <Meter progress={stream.progress} />
       <div className="row">
         <span className="muted">
           {stream.cancelled
             ? "Cancelled"
-            : `${Math.round(stream.progress * 100)}% vested`}
+            : locked
+              ? "Locked until the cliff"
+              : `${Math.round(stream.progress * 100)}% vested`}
         </span>
         <span className="row-actions">
           {canWithdraw && (

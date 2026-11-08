@@ -44,6 +44,8 @@ export default function App() {
     values: CreateStreamFormValues,
   ): Promise<boolean> => {
     if (!address) return false;
+    const startInSeconds =
+      values.startIn.trim() === "" ? 0 : Number(values.startIn);
     try {
       await createMutation.mutateAsync({
         sender: address,
@@ -51,6 +53,14 @@ export default function App() {
         token: values.token.trim(),
         amount: values.amount.trim(),
         durationSeconds: Number(values.duration),
+        // The contract takes an absolute `start_time`, so the SDK gets the
+        // relative delay and anchors it when the transaction is built. Blank/0
+        // leaves it unset: the contract stamps the ledger time and the call
+        // stays the plain `create_stream`.
+        startDelaySeconds: startInSeconds > 0 ? startInSeconds : undefined,
+        // Empty cliff = no cliff, so the call stays the plain `create_stream`.
+        cliffSeconds:
+          values.cliff.trim() === "" ? undefined : Number(values.cliff),
       });
       return true;
     } catch {

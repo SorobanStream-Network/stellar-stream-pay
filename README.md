@@ -343,7 +343,8 @@ container, or scrape the host directly) and alert on:
 
 | Function | Auth | Description |
 |----------|------|-------------|
-| `create_stream(sender, receiver, token, amount, duration_seconds) -> u64` | `sender` | Locks `amount` (base units) from `sender` and starts a stream. |
+| `create_stream(sender, receiver, token, amount, duration_seconds) -> u64` | `sender` | Locks `amount` (base units) from `sender` and starts a stream. Exact alias of `create_stream_scheduled(.., None, None)` (start now, no cliff). |
+| `create_stream_scheduled(sender, receiver, token, amount, duration_seconds, start_time: Option<u64>, cliff_seconds: Option<u64>) -> u64` | `sender` | Same, with an optional future `start_time` and an optional cliff. Nothing is withdrawable before `start_time + cliff_seconds`; the cliff gates the unlock without re-basing the schedule. |
 | `withdraw(receiver, stream_id) -> i128` | `receiver` | Pays out the currently accrued (un-withdrawn) amount. |
 | `cancel(caller, stream_id) -> i128` | `sender` or `receiver` | Settles the stream: pays the vested remainder to the receiver and refunds the unvested remainder to the sender. |
 | `get_stream(stream_id) -> Stream` | — | Read a stream. |
@@ -369,10 +370,15 @@ The backend reads both directly via RPC `getContractData`.
   SEP-41 `token::Client`, which enforces its own auth.
 - **Input guards** — `InvalidDuration` rejects `duration_seconds == 0` *before*
   any storage write (no divide-by-zero in vesting math); `InvalidAmount` rejects
-  non-positive amounts; `InvalidParties` rejects sender == receiver; a missing
-  stream id returns `StreamNotFound` and a second `withdraw` on a fully-drawn
-  stream returns `NothingToWithdraw` / `StreamCancelled` — clean `Error` codes,
-  never panics.
+  non-positive amounts; `InvalidParties` rejects sender == receiver;
+  `StartTimeInPast` rejects a backwards-dated schedule (anything more than two
+  minutes behind the executing ledger — `START_TIME_GRACE_SECONDS` — so ordinary
+  inclusion lag is tolerated) and `InvalidCliff` rejects
+  `cliff_seconds > duration_seconds`; a missing stream id returns
+  `StreamNotFound`, and a second `withdraw` on a fully-drawn stream returns
+  `NothingToWithdraw` — including a stream cancelled earlier, since `cancel`
+  settles the vested remainder in the same call. Clean `Error` codes, never
+  panics.
 - **Check-effects-interactions** — stream state is updated *before* external token
   calls, and arithmetic overflow traps (rather than wraps) via
   `overflow-checks = true` in the release profile (contract `Cargo.toml`).
@@ -390,8 +396,10 @@ The backend reads both directly via RPC `getContractData`.
   trustlines are checked before the wallet dialog; simulation and submission
   errors are decoded into readable messages (`decodeSorobanError`).
 - **Rent bumping** — `create`/`withdraw`/`cancel`/`bump`/`bump_many`/`bump_instance` extend
-  the persistent entries *and* the contract instance/code TTL to the network
-  maximum, so neither streams nor the vault are archived mid-term.
+  the persistent entries to a 180-day lease (`TTL_EXTEND_TO_LEDGERS`, clamped to
+  the network maximum) and read paths re-arm them too, while the contract
+  instance/code entries go to the network maximum, so neither streams nor the
+  vault are archived mid-term.
 - **Indexer scaling** — the backend maintains an in-memory index of stream state
   by seeding once and polling the contract's `created` / `withdrawn` / `cancelled`
   events (`getEvents`) forward, so `/api/streams` and `/api/stream/:address` are
@@ -404,7 +412,7 @@ See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
 The repo is verified at every layer — CI (`.github/workflows/`) runs all of
 this on every push:
 
-**Contract (`cargo test -p stream-core` from `contracts/`) — 66 tests:**
+**Contract (`cargo test -p stream-core` from `contracts/`) — 78 tests:**
 
 - **Vesting math** — property tests (`proptest`) randomize the time-weighted
   accrual formula across thousands of cases (`vested_amount_is_bounded`,

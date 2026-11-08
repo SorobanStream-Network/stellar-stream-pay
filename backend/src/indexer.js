@@ -10,8 +10,10 @@
  *
  * Streams are never deleted, so the fold is append-only state updates:
  *
- *   created    -> { sender, receiver, token, total, start, end, withdrawn: 0,
- *                   cancelled: false }
+ *   created    -> { sender, receiver, token, total, start, end, cliff,
+ *                   withdrawn: 0, cancelled: false }
+ *                 (`cliff` defaults to `start` for events published before the
+ *                 schedule upgrade, so the fold is correct for both eras)
  *   withdraw   -> withdrawn += receiver_amount   (== amount for single streams)
  *   cancelled  -> cancelled = true; withdrawn += receiver_amount
  *                 (the contract sets withdrawn = accrued on cancel, so after
@@ -95,6 +97,7 @@ export function decodeEvent(e) {
     receiver_amount: value.receiver_amount != null ? String(value.receiver_amount) : null,
     start_time: value.start_time != null ? String(value.start_time) : null,
     end_time: value.end_time != null ? String(value.end_time) : null,
+    cliff_time: value.cliff_time != null ? String(value.cliff_time) : null,
     ledger: e.ledger,
     txHash: e.txHash,
     id: e.id,
@@ -172,6 +175,9 @@ export function foldEvent(index, e) {
       total_amount: BigInt(e.amount),
       start_time: BigInt(e.start_time),
       end_time: BigInt(e.end_time),
+      // Absent on `created` events from before the schedule upgrade; a stream
+      // with no cliff has `cliff_time == start_time`, so the default is exact.
+      cliff_time: e.cliff_time != null ? BigInt(e.cliff_time) : BigInt(e.start_time),
       withdrawn: 0n,
       cancelled: false,
       cancelled_at: 0n,
@@ -226,6 +232,8 @@ export async function seedFromStorage({ rpc, contractId, index }) {
       total_amount: raw.total_amount,
       start_time: raw.start_time,
       end_time: raw.end_time,
+      // Entries written before the schedule upgrade have no `cliff_time`.
+      cliff_time: raw.cliff_time ?? raw.start_time,
       withdrawn: raw.withdrawn,
       cancelled: raw.cancelled,
       cancelled_at: raw.cancelled_at,
@@ -332,8 +340,17 @@ export function startIndexer({
 // Enrichment (mirrors the contract's vesting math + the old scan endpoint)
 // ---------------------------------------------------------------------------
 
-/** Mirror the contract's linear vesting formula (all BigInt). */
-export function vestedAmount(total, start, end, now) {
+/**
+ * Mirror the contract's linear vesting formula (all BigInt).
+ *
+ * `cliff` gates the unlock without re-basing the schedule: nothing accrues
+ * before `cliff`, and from `cliff` on the ordinary `start`→`end` line applies,
+ * so the pre-cliff portion unlocks at once. It defaults to `start`, which is
+ * exactly `create_stream`'s no-cliff behaviour (and the value stored for every
+ * stream created before the schedule upgrade).
+ */
+export function vestedAmount(total, start, end, now, cliff = start) {
+  if (now < cliff) return 0n;
   if (now <= start) return 0n;
   const t = now < end ? now : end;
   const elapsed = t - start;
@@ -346,25 +363,28 @@ export function vestedAmount(total, start, end, now) {
  * Decorate a folded index stream with computed accrual/withdrawable/progress,
  * matching the response shape the frontend already consumes from the scan
  * endpoint. For a cancelled stream, vesting is frozen: the folded `withdrawn`
- * IS the vested-at-freeze amount, so accrued == withdrawn and withdrawable
- * is 0 (the contract rejects post-cancel withdraws with `StreamCancelled`).
+ * IS the vested-at-freeze amount, so accrued == withdrawn and withdrawable is
+ * 0. (`cancel` settles eagerly, and a later `withdraw` on a settled stream
+ * falls through to `NothingToWithdraw`, so there is nothing left to claim.)
  */
 export function enrichStream(s, now) {
+  const cliff = s.cliff_time ?? s.start_time;
   const accrued = s.cancelled
     ? s.withdrawn
-    : vestedAmount(s.total_amount, s.start_time, s.end_time, now);
+    : vestedAmount(s.total_amount, s.start_time, s.end_time, now, cliff);
   const withdrawable = s.cancelled ? 0n : accrued - s.withdrawn;
   const duration = s.end_time - s.start_time;
-  // Progress is elapsed/duration while active; for a cancelled stream the
-  // folded `withdrawn` is the vested-at-freeze amount, so withdrawn/total is
-  // the exact frozen progress.
+  // Progress is elapsed/duration while active, and 0 until the cliff has
+  // passed (the cliff delays the unlock; it does not shorten the term). For a
+  // cancelled stream the folded `withdrawn` is the vested-at-freeze amount, so
+  // withdrawn/total is the exact frozen progress.
   const progress = s.cancelled
     ? s.total_amount === 0n
       ? 1
       : Number(s.withdrawn) / Number(s.total_amount)
     : duration === 0n
       ? 1
-      : Number(now <= s.start_time ? 0n : now < s.end_time ? now - s.start_time : duration) /
+      : Number(now < cliff ? 0n : now < s.end_time ? now - s.start_time : duration) /
           Number(duration);
 
   return {
@@ -378,6 +398,7 @@ export function enrichStream(s, now) {
     withdrawable: withdrawable.toString(),
     start_time: s.start_time.toString(),
     end_time: s.end_time.toString(),
+    cliff_time: cliff.toString(),
     cancelled: s.cancelled,
     progress: Math.min(Math.max(progress, 0), 1),
   };

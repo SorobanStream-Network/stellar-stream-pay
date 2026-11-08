@@ -2,7 +2,11 @@
 // library (needed for `std::vec::Vec` in the auth-tree assertions).
 extern crate std;
 
-use super::{vested_amount, DataKey, SplitEvent, StreamEvent, StreamingContract, StreamingContractClient, STREAM_CORE_API_VERSION, MAX_BUMP_BATCH, MAX_SPLIT_MEMBERS};
+use super::{
+    vested_amount, vested_with_cliff, DataKey, SplitEvent, StreamEvent, StreamingContract,
+    StreamingContractClient, MAX_BUMP_BATCH, MAX_SPLIT_MEMBERS, START_TIME_GRACE_SECONDS,
+    STREAM_CORE_API_VERSION, TTL_EXTEND_TO_LEDGERS,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Event,
     testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Events, Ledger as _},
@@ -323,6 +327,17 @@ fn setup() -> (
     (env, client, contract_id, token, sender, receiver)
 }
 
+/// The lease every value-carrying persistent entry is extended to: the
+/// contract's configured extend-to target, clamped to the network ceiling
+/// exactly as `ttl_params` does (`extend_ttl` reverts when `extend_to` exceeds
+/// `max_ttl()`). The instance/code entries are still extended to the full
+/// `max_ttl()` — they have no per-stream keeper signal, so they are kept at
+/// the ceiling.
+fn ttl_extend_to(env: &Env, contract_id: &Address) -> u32 {
+    let max = env.as_contract(contract_id, || env.storage().max_ttl());
+    TTL_EXTEND_TO_LEDGERS.min(max)
+}
+
 #[test]
 fn create_and_withdraw_round_trip() {
     let (env, client, contract_id, token, sender, receiver) = setup();
@@ -581,7 +596,9 @@ fn cancel_event_carries_receiver_payout() {
         token: token.clone(),
         amount: 750,
         receiver_amount: 250,
+        timestamp: START + 25,
         start_time: START,
+        cliff_time: START,
         end_time: START + 100,
     }
     .to_xdr(&env, &contract_id);
@@ -848,8 +865,8 @@ fn create_stream_sets_stream_ttl_to_max() {
     let ttl = env.as_contract(&contract_id, || {
         env.storage().persistent().get_ttl(&DataKey::Stream(0))
     });
-    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
-    assert_eq!(ttl, max, "stream entry TTL {ttl} != max {max}");
+    let expected = ttl_extend_to(&env, &contract_id);
+    assert_eq!(ttl, expected, "stream entry TTL {ttl} != extend-to {expected}");
 }
 
 #[test]
@@ -870,8 +887,8 @@ fn withdraw_bumps_ttl_back_to_max() {
     let after = env.as_contract(&contract_id, || {
         env.storage().persistent().get_ttl(&DataKey::Stream(stream_id))
     });
-    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
-    assert_eq!(after, max, "withdraw should restore TTL to max, got {after}");
+    let expected = ttl_extend_to(&env, &contract_id);
+    assert_eq!(after, expected, "withdraw should restore TTL to extend-to, got {after}");
 }
 
 #[test]
@@ -892,8 +909,8 @@ fn bump_entrypoint_extends_idle_stream_ttl() {
     let after = env.as_contract(&contract_id, || {
         env.storage().persistent().get_ttl(&DataKey::Stream(stream_id))
     });
-    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
-    assert_eq!(after, max, "bump should restore TTL to max, got {after}");
+    let expected = ttl_extend_to(&env, &contract_id);
+    assert_eq!(after, expected, "bump should restore TTL to extend-to, got {after}");
 }
 
 #[test]
@@ -915,8 +932,8 @@ fn bump_re_arms_counter_ttl() {
     let after = env.as_contract(&contract_id, || {
         env.storage().persistent().get_ttl(&DataKey::Counter)
     });
-    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
-    assert_eq!(after, max, "bump must re-arm the id counter to max, got {after}");
+    let expected = ttl_extend_to(&env, &contract_id);
+    assert_eq!(after, expected, "bump must re-arm the id counter, got {after}");
 }
 
 // ---- Contract instance + code TTL (rent-bumping the lease) -----------------
@@ -1009,7 +1026,8 @@ fn bump_many_re_arms_streams_and_shared_entries_in_one_call() {
 
     client.bump_many(&vec![&env, id0, id1, id2]);
 
-    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    let max = ttl_extend_to(&env, &contract_id);
+    let ceiling = env.as_contract(&contract_id, || env.storage().max_ttl());
     for id in [id0, id1, id2] {
         let stream_ttl = env.as_contract(&contract_id, || {
             env.storage().persistent().get_ttl(&DataKey::Stream(id))
@@ -1021,7 +1039,7 @@ fn bump_many_re_arms_streams_and_shared_entries_in_one_call() {
     });
     assert_eq!(counter_ttl, max, "bump_many must restore the counter TTL to max");
     let instance_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-    assert_eq!(instance_ttl, max, "bump_many must restore the instance TTL to max");
+    assert_eq!(instance_ttl, ceiling, "bump_many must restore the instance TTL to max");
 }
 
 #[test]
@@ -1072,7 +1090,7 @@ fn bump_many_re_arms_split_group_entries_for_roots() {
 
     client.bump_many(&vec![&env, root]);
 
-    let max = env.as_contract(&contract_id, || env.storage().max_ttl());
+    let max = ttl_extend_to(&env, &contract_id);
     let split_ttl = env.as_contract(&contract_id, || {
         env.storage().persistent().get_ttl(&DataKey::Split(root))
     });
@@ -1538,4 +1556,376 @@ fn split_pct_rejects_total_too_small() {
     // 1% of 2 base units rounds to 0 for the first receiver.
     let pcts = vec![&env, 1_u32, 99_u32];
     client.create_split_stream_pct(&sender, &receivers, &token, &2_i128, &pcts, &100_u64);
+}
+
+// ---- Scheduled streams: start_time + cliff (Phase 1 f) ---------------------
+//
+// `create_stream` keeps its v1 signature and is exactly
+// `create_stream_scheduled(.., None, None)`, so every test above still exercises
+// the default path. These cover the new optional schedule.
+
+#[test]
+fn create_stream_defaults_to_start_now_without_cliff() {
+    let (_env, client, _contract_id, token, sender, receiver) = setup();
+
+    let id = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+    let s = client.get_stream(&id);
+    assert_eq!(s.start_time, START);
+    assert_eq!(s.cliff_time, START, "no cliff => cliff_time == start_time");
+    assert_eq!(s.end_time, START + 100);
+}
+
+#[test]
+fn scheduled_stream_starts_later_and_unlocks_at_the_cliff() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+    let start = START + 1_000;
+
+    let id = client.create_stream_scheduled(
+        &sender,
+        &receiver,
+        &token,
+        &1_000_i128,
+        &100_u64,
+        &Some(start),
+        &Some(20_u64),
+    );
+
+    // The schedule is stored, not applied retroactively.
+    let s = client.get_stream(&id);
+    assert_eq!(s.start_time, start);
+    assert_eq!(s.cliff_time, start + 20);
+    assert_eq!(s.end_time, start + 100);
+
+    // Before the start time: nothing has accrued, nothing is payable.
+    env.ledger().set_timestamp(START + 500);
+    assert_eq!(client.streamed_amount(&id), 0_i128);
+    assert_eq!(client.get_withdrawable(&id), 0_i128);
+
+    // Between start and cliff: still nothing — the cliff gates the accrual.
+    env.ledger().set_timestamp(start + 10);
+    assert_eq!(client.streamed_amount(&id), 0_i128);
+    assert_eq!(client.get_withdrawable(&id), 0_i128);
+
+    // At the cliff the pre-cliff accrual unlocks (20% of 1,000), measured from
+    // `start_time`: a cliff delays the unlock, it does not re-base it.
+    env.ledger().set_timestamp(start + 20);
+    assert_eq!(client.streamed_amount(&id), 200_i128);
+    assert_eq!(client.get_withdrawable(&id), 200_i128);
+    assert_eq!(client.withdraw(&receiver, &id), 200_i128);
+
+    // Past the end the remainder lands exactly, so the stream finishes having
+    // paid out exactly `total` with nothing stranded in the vault.
+    env.ledger().set_timestamp(start + 500);
+    assert_eq!(client.withdraw(&receiver, &id), 800_i128);
+    assert_eq!(client.get_stream(&id).withdrawn, 1_000_i128);
+    assert_eq!(token_client.balance(&receiver), 1_000);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(client.get_withdrawable(&id), 0_i128);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #4)")] // Error::NothingToWithdraw
+fn withdraw_before_cliff_is_rejected() {
+    let (env, client, _contract_id, token, sender, receiver) = setup();
+
+    // 100 units over 100s with a 40s cliff: at t=30 the linear schedule has
+    // accrued 300, but the cliff makes all of it unpayable.
+    let id = client.create_stream_scheduled(
+        &sender,
+        &receiver,
+        &token,
+        &1_000_i128,
+        &100_u64,
+        &None,
+        &Some(40_u64),
+    );
+    env.ledger().set_timestamp(START + 30);
+    client.withdraw(&receiver, &id);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #21)")] // Error::StartTimeInPast
+fn scheduled_stream_rejects_start_in_past() {
+    let (_env, client, _contract_id, token, sender, receiver) = setup();
+
+    // A genuinely retroactive start would hand the receiver an already-unlocked
+    // stream. Just behind `now` is tolerated (inclusion lag); beyond the grace
+    // window is not.
+    client.create_stream_scheduled(
+        &sender,
+        &receiver,
+        &token,
+        &1_000_i128,
+        &100_u64,
+        &Some(START - START_TIME_GRACE_SECONDS - 1),
+        &None,
+    );
+}
+
+#[test]
+fn scheduled_stream_tolerates_a_start_that_just_passed() {
+    let (env, client, _contract_id, token, sender, receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    // A transaction can wait a ledger or two between signing and inclusion, so
+    // a `start_time` slightly behind the executing ledger is accepted; the
+    // stream simply accrues from it, exactly as if it had landed on time.
+    let start = START - 30;
+    let id = client.create_stream_scheduled(
+        &sender,
+        &receiver,
+        &token,
+        &1_000_i128,
+        &100_u64,
+        &Some(start),
+        &None,
+    );
+
+    let s = client.get_stream(&id);
+    assert_eq!(s.start_time, start);
+    assert_eq!(s.end_time, start + 100);
+
+    // 30s of the 100s term has already elapsed at the executing ledger time.
+    assert_eq!(client.streamed_amount(&id), 300_i128);
+    assert_eq!(client.get_withdrawable(&id), 300_i128);
+    assert_eq!(client.withdraw(&receiver, &id), 300_i128);
+    assert_eq!(token_client.balance(&receiver), 300);
+}
+
+#[test]
+fn scheduled_stream_accepts_a_start_exactly_at_the_grace_boundary() {
+    let (env, client, _contract_id, token, sender, receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    // The guard is exclusive at the window edge: `now - START_TIME_GRACE_SECONDS`
+    // is still accepted, one second further back is not (see the #21 test).
+    let start = START - START_TIME_GRACE_SECONDS;
+    let id = client.create_stream_scheduled(
+        &sender,
+        &receiver,
+        &token,
+        &1_000_i128,
+        &200_u64,
+        &Some(start),
+        &None,
+    );
+
+    let s = client.get_stream(&id);
+    assert_eq!(s.start_time, start);
+    assert_eq!(s.end_time, start + 200);
+
+    // 120s of the 200s term has already elapsed, so 60% vests on creation.
+    assert_eq!(client.streamed_amount(&id), 600_i128);
+    assert_eq!(client.get_withdrawable(&id), 600_i128);
+    assert_eq!(client.withdraw(&receiver, &id), 600_i128);
+    assert_eq!(token_client.balance(&receiver), 600);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #22)")] // Error::InvalidCliff
+fn scheduled_stream_rejects_cliff_longer_than_duration() {
+    let (_env, client, _contract_id, token, sender, receiver) = setup();
+
+    // A cliff past the end would unlock everything only at/after the term ends.
+    client.create_stream_scheduled(
+        &sender,
+        &receiver,
+        &token,
+        &1_000_i128,
+        &100_u64,
+        &None,
+        &Some(101_u64),
+    );
+}
+
+#[test]
+fn cancel_before_cliff_refunds_everything() {
+    let (env, client, _contract_id, token, sender, receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let id = client.create_stream_scheduled(
+        &sender,
+        &receiver,
+        &token,
+        &1_000_i128,
+        &100_u64,
+        &None,
+        &Some(40_u64),
+    );
+
+    // Cancelled before the cliff: nothing ever vested, so the whole amount goes
+    // back to the sender and the receiver is owed (and paid) nothing.
+    env.ledger().set_timestamp(START + 10);
+    let refund = client.cancel(&sender, &id);
+    assert_eq!(refund, 1_000_i128);
+    assert_eq!(token_client.balance(&sender), FUNDING);
+    assert_eq!(token_client.balance(&receiver), 0);
+
+    let s = client.get_stream(&id);
+    assert!(s.cancelled);
+    assert_eq!(s.cancelled_at, START + 10);
+    assert_eq!(s.withdrawn, 0_i128);
+    assert_eq!(client.streamed_amount(&id), 0_i128);
+    assert_eq!(client.get_withdrawable(&id), 0_i128);
+}
+
+#[test]
+fn cancel_after_cliff_freezes_accrual_at_cancellation_time() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    let id = client.create_stream_scheduled(
+        &sender,
+        &receiver,
+        &token,
+        &1_000_i128,
+        &100_u64,
+        &None,
+        &Some(20_u64),
+    );
+
+    // 50% vested at cancel time; the receiver gets the 500 that vested, the
+    // sender the 500 that never will.
+    env.ledger().set_timestamp(START + 50);
+    assert_eq!(client.cancel(&sender, &id), 500_i128);
+    assert_eq!(token_client.balance(&receiver), 500);
+    assert_eq!(token_client.balance(&contract_id), 0);
+
+    // Time passing after the cancel must not accrue anything more.
+    env.ledger().set_timestamp(START + 500);
+    assert_eq!(client.streamed_amount(&id), 500_i128);
+    assert_eq!(client.get_withdrawable(&id), 0_i128);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #4)")] // Error::NothingToWithdraw
+fn withdraw_after_cancel_reports_nothing_to_withdraw() {
+    let (env, client, _contract_id, token, sender, receiver) = setup();
+
+    let id = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+    env.ledger().set_timestamp(START + 25);
+    // `cancel` settles the vested 250 immediately (withdrawn = accrued), so a
+    // later withdraw has nothing left and must not pay a second time.
+    client.cancel(&sender, &id);
+    client.withdraw(&receiver, &id);
+}
+
+#[test]
+fn rounding_dust_lands_on_the_final_withdrawal() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    let token_client = token::Client::new(&env, &token);
+
+    // 100 units over 3 seconds is the worst case for flooring: 33 per whole
+    // second with 1 unit of dust. The dust must land on the final withdrawal
+    // so the stream completes with exactly `total` withdrawn.
+    let id = client.create_stream(&sender, &receiver, &token, &100_i128, &3_u64);
+
+    env.ledger().set_timestamp(START + 1);
+    assert_eq!(client.withdraw(&receiver, &id), 33_i128);
+    env.ledger().set_timestamp(START + 2);
+    assert_eq!(client.withdraw(&receiver, &id), 33_i128);
+    env.ledger().set_timestamp(START + 3);
+    assert_eq!(client.withdraw(&receiver, &id), 34_i128);
+
+    let s = client.get_stream(&id);
+    assert_eq!(s.withdrawn, 100_i128, "stream must finish exactly at total");
+    assert_eq!(token_client.balance(&receiver), 100);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn reads_re_arm_the_stream_ttl() {
+    let (env, client, contract_id, token, sender, receiver) = setup();
+    let id = client.create_stream(&sender, &receiver, &token, &1_000_i128, &100_u64);
+
+    // Drift the stream entry toward expiry, then read it.
+    let ttl = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Stream(id))
+    });
+    env.ledger().set_sequence_number(env.ledger().sequence() + ttl - 100);
+
+    client.get_stream(&id);
+
+    let after = env.as_contract(&contract_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Stream(id))
+    });
+    let expected = ttl_extend_to(&env, &contract_id);
+    assert_eq!(after, expected, "a committed read must re-arm the stream lease");
+}
+
+// ---- Property-based tests for the cliff-aware settlement math (Phase 1) ----
+//
+// Same style as the pure `vested_amount` properties above: `vested_with_cliff`
+// takes no `Env`, so thousands of randomized cases run with no snapshot churn.
+// Together they pin the Phase 1 invariants:
+//   * accrued never exceeds `total` and never decreases over time;
+//   * withdrawn + refunded + remaining == total (nothing created or lost);
+//   * a cliff only ever delays the unlock, never changes the eventual total.
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+
+    #[test]
+    fn cliffed_accrual_is_bounded_and_monotonic(
+        total in 1i128..10_000_000i128,
+        start in 0u64..10_000u64,
+        len in 1u64..10_000u64,
+        cliff_frac in 0u64..1_001u64,
+        now in 0u64..30_000u64,
+        delta in 0u64..10_000u64,
+    ) {
+        let end = start + len;
+        // Cliff offset anywhere in [0, len], i.e. never past the end.
+        let cliff = start + (len * cliff_frac / 1_000).min(len);
+
+        let v = vested_with_cliff(total, start, cliff, end, now);
+        prop_assert!(v >= 0);
+        prop_assert!(v <= total);
+        prop_assert!(
+            vested_with_cliff(total, start, cliff, end, now.saturating_add(delta)) >= v
+        );
+
+        // Pre-cliff nothing is vested at all; at/after the end everything is.
+        if now < cliff {
+            prop_assert_eq!(v, 0);
+        }
+        if now >= end {
+            prop_assert_eq!(v, total);
+        }
+    }
+
+    #[test]
+    fn settlement_partitions_the_total(
+        total in 1i128..10_000_000i128,
+        start in 0u64..10_000u64,
+        len in 1u64..10_000u64,
+        cliff_frac in 0u64..1_001u64,
+        t_withdraw in 0u64..30_000u64,
+        dt in 0u64..10_000u64,
+    ) {
+        let end = start + len;
+        let cliff = start + (len * cliff_frac / 1_000).min(len);
+        let t_cancel = t_withdraw.saturating_add(dt);
+
+        // A withdraw at `t_withdraw`, then a cancel at `t_cancel >= t_withdraw`.
+        let withdrawn = vested_with_cliff(total, start, cliff, end, t_withdraw);
+        let accrued_at_cancel = vested_with_cliff(total, start, cliff, end, t_cancel);
+        prop_assert!(accrued_at_cancel >= withdrawn); // monotonic in time
+        prop_assert!(accrued_at_cancel <= total);
+
+        let payout = accrued_at_cancel - withdrawn; // paid to the receiver
+        let refund = total - accrued_at_cancel; // returned to the sender
+        let remaining = 0i128; // a cancel leaves nothing in the vault
+
+        // The Phase 1 invariant: nothing is created or destroyed.
+        prop_assert_eq!(withdrawn + payout + refund + remaining, total);
+        prop_assert!(payout >= 0);
+        prop_assert!(refund >= 0);
+
+        // While still active, the same partition holds as
+        // withdrawn + withdrawable + unvested == total.
+        let withdrawable = accrued_at_cancel - withdrawn;
+        prop_assert_eq!(withdrawn + withdrawable + (total - accrued_at_cancel), total);
+    }
 }

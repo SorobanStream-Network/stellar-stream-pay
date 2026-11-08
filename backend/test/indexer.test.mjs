@@ -121,6 +121,7 @@ test("decodes a raw RPC event (topics + map value) into JSON-safe fields", () =>
       receiver_amount: 0n,
       start_time: 100n,
       end_time: 200n,
+      cliff_time: 150n,
     }),
   };
   const d = decodeEvent(raw);
@@ -132,6 +133,7 @@ test("decodes a raw RPC event (topics + map value) into JSON-safe fields", () =>
   assert.equal(d.receiver_amount, "0");
   assert.equal(d.start_time, "100");
   assert.equal(d.end_time, "200");
+  assert.equal(d.cliff_time, "150");
 });
 
 test("seeds from a storage scan (counter + per-stream getContractData)", async () => {
@@ -143,6 +145,7 @@ test("seeds from a storage scan (counter + per-stream getContractData)", async (
     total_amount: 1000n,
     start_time: 100n,
     end_time: 200n,
+    cliff_time: 150n,
     withdrawn: 250n,
     cancelled: false,
     cancelled_at: 0n,
@@ -168,6 +171,7 @@ test("seeds from a storage scan (counter + per-stream getContractData)", async (
   assert.equal(s.sender, SENDER);
   assert.equal(s.total_amount, 1000n);
   assert.equal(s.withdrawn, 250n);
+  assert.equal(s.cliff_time, 150n);
 });
 
 test("backfills from events across ledger windows and keeps the forward cursor", async () => {
@@ -273,10 +277,59 @@ test("enrichStream mirrors the contract vesting math and freezes cancelled strea
   assert.equal(e2.withdrawable, "800");
   assert.equal(e2.progress, 1);
 
-  // Cancelled: frozen at the folded withdrawn amount, withdrawable 0 (the
-  // contract rejects post-cancel withdraws with `StreamCancelled`).
+  // Cancelled: frozen at the folded withdrawn amount, withdrawable 0. `cancel`
+  // settles eagerly and a post-cancel `withdraw` returns `NothingToWithdraw`,
+  // so there is nothing left to claim.
   const c = enrichStream({ ...s, withdrawn: 500n, cancelled: true }, 999n);
   assert.equal(c.accrued, "500");
   assert.equal(c.withdrawable, "0");
   assert.equal(c.cancelled, true);
+});
+
+test("enrichStream gates accrual on the cliff without re-basing the schedule", () => {
+  const s = {
+    id: 1,
+    sender: SENDER,
+    receiver: RECEIVER,
+    token: TOKEN,
+    total_amount: 1000n,
+    start_time: 100n,
+    end_time: 200n,
+    cliff_time: 150n,
+    withdrawn: 0n,
+    cancelled: false,
+    cancelled_at: 0n,
+  };
+
+  // Before the cliff nothing accrues, even though the linear line has moved.
+  assert.equal(vestedAmount(s.total_amount, s.start_time, s.end_time, 120n, s.cliff_time), 0n);
+  const before = enrichStream(s, 120n);
+  assert.equal(before.accrued, "0");
+  assert.equal(before.withdrawable, "0");
+  assert.equal(before.progress, 0);
+  assert.equal(before.cliff_time, "150");
+
+  // At the cliff the pre-cliff portion unlocks: 50% of [100, 200].
+  const at = enrichStream(s, 150n);
+  assert.equal(at.accrued, "500");
+  assert.equal(at.withdrawable, "500");
+  assert.equal(at.progress, 0.5);
+
+  // Past it, the original start->end schedule continues unchanged.
+  assert.equal(enrichStream(s, 175n).accrued, "750");
+  assert.equal(enrichStream(s, 999n).accrued, "1000");
+
+  // A record from before the schedule upgrade has no `cliff_time`: the plain
+  // linear line applies, exactly as before the change.
+  const { cliff_time: _omitted, ...legacy } = s;
+  assert.equal(enrichStream(legacy, 120n).accrued, "200");
+  assert.equal(enrichStream(legacy, 120n).cliff_time, "100");
+});
+
+test("foldEvent defaults cliff_time to start_time for pre-upgrade created events", () => {
+  const index = createStreamIndex();
+  foldEvent(index, evt("created", { stream_id: 5 }));
+  assert.equal(index.streams.get(5).cliff_time, 100n, "no cliff => cliff_time == start_time");
+  foldEvent(index, evt("created", { stream_id: 6, cliff_time: "130" }));
+  assert.equal(index.streams.get(6).cliff_time, 130n);
 });

@@ -55,7 +55,14 @@ use soroban_sdk::{
 /// in one transaction (large fleets pay one tx per pass instead of one per
 /// stream). Any further breaking change to the function signatures below is a
 /// migration event (redeploy + reindex) and requires another version bump.
-pub const STREAM_CORE_API_VERSION: u32 = 4;
+///
+/// v5 (Phase 1 hardening): `create_stream_scheduled` adds an optional
+/// `start_time` + `cliff_seconds`; `Stream` gains `cliff_time` and
+/// `StreamEvent` gains `timestamp` + `cliff_time` (additive for name-based
+/// decoders, but a `Stream` written by v4 does NOT decode into v5, so this is
+/// a redeploy-and-reindex migration). `create_stream` keeps its exact v1
+/// signature — it delegates to the scheduled form with "start now, no cliff".
+pub const STREAM_CORE_API_VERSION: u32 = 5;
 
 /// Upper bound on the number of receivers in a single split stream.
 /// FIX (Finding 4): one storage entry + one event are written per member, so
@@ -72,6 +79,51 @@ pub const MAX_SPLIT_MEMBERS: u32 = 32;
 /// front keeps keepers honest. Keepers should chunk large fleets into batches
 /// of this size or smaller.
 pub const MAX_BUMP_BATCH: u32 = 32;
+
+/// Low-water mark for the persistent entries that carry value (`Stream`,
+/// `Split`, `Counter`): once an entry's remaining lease drops below this, the
+/// next read or write re-arms it.
+///
+/// Ledgers close roughly every 5 seconds, so 30 days ≈ 518_400 ledgers. The
+/// threshold is a *re-arm trigger*, not the lease length: `extend_ttl` is a
+/// cheap no-op while the entry is above it, so the hot path (create / withdraw
+/// / cancel) only pays for the extension when it is actually needed. 30 days
+/// is deliberately much longer than the shipped keeper relayer's interval (one
+/// pass per hour), so a keeper outage of weeks still cannot strand a stream.
+pub const TTL_THRESHOLD_LEDGERS: u32 = 30 * 24 * 60 * 12;
+
+/// The lease value persistent entries are extended *to*: 180 days ≈ 3_110_400
+/// ledgers, half of the protocol's ~365-day ceiling, so two full extensions can
+/// never be needed within one ceiling window and an idle-but-armed entry has a
+/// six-month buffer.
+///
+/// This is always clamped to `env.storage().max_ttl()` before use: the ceiling
+/// is a network parameter that can change, and `extend_ttl` reverts when
+/// `extend_to > max_ttl()`. A pinned constant must therefore never be passed to
+/// `extend_ttl` unclamped (see `ttl_params`).
+pub const TTL_EXTEND_TO_LEDGERS: u32 = 180 * 24 * 60 * 12;
+
+/// How far below the ceiling the contract instance + Wasm code are allowed to
+/// drift before they are re-armed. Unlike stream data these entries have no
+/// per-stream keeper signal: if the instance is archived the contract cannot
+/// be invoked at all and every locked stream is stranded, so they are re-armed
+/// whenever they are not already at the ceiling (`max_ttl - 1` threshold).
+pub const INSTANCE_TTL_REARM_MARGIN_LEDGERS: u32 = 1;
+
+/// How far behind the executing ledger a `start_time` may be and still be
+/// accepted by [`StreamingContract::create_stream_scheduled`].
+///
+/// A scheduled stream is built with an absolute `start_time`, but the
+/// transaction can sit in the queue for a ledger or two (~5s each) between
+/// signing and inclusion. Rejecting a start time that has slipped a few seconds
+/// into the past would turn that ordinary delay into a failed transaction, so a
+/// two-minute window is tolerated.
+///
+/// The guard itself stays meaningful: anything further back is a *back-dated*
+/// schedule, which would hand the receiver a stream that is already partly
+/// unlocked at creation — the sender could then cancel and lose nothing, which
+/// is not a stream.
+pub const START_TIME_GRACE_SECONDS: u64 = 120;
 
 /// Persistent-storage keys.
 #[contracttype]
@@ -100,7 +152,12 @@ pub struct Stream {
     pub token: Address,
     pub total_amount: i128,
     pub start_time: u64, // ledger timestamp (unix seconds)
-    pub end_time: u64,   // ledger timestamp (unix seconds)
+    /// Vesting gate (unix seconds): nothing accrues or is payable before this
+    /// timestamp, and after it the ordinary linear schedule from `start_time`
+    /// applies (a cliff delays the unlock, it does not re-base the schedule).
+    /// Equal to `start_time` when the stream has no cliff.
+    pub cliff_time: u64,
+    pub end_time: u64, // ledger timestamp (unix seconds)
     pub withdrawn: i128, // cumulative amount the receiver has received
     pub cancelled: bool,
     pub cancelled_at: u64, // vesting freeze time; 0 while the stream is active
@@ -124,13 +181,17 @@ pub struct SplitGroup {
 /// Topics (filterable): `kind` ∈ {"created" | "withdraw" | "cancelled"},
 /// `stream_id`, `sender`, `receiver`.
 ///
-/// Data: `token`, `amount`, `receiver_amount`, `start_time`, `end_time`.
+/// Data: `token`, `amount`, `receiver_amount`, `timestamp`, `start_time`,
+/// `cliff_time`, `end_time`.
 /// * `amount` is the sender-side amount: total locked (`created`), withdrawn
 ///   (`withdraw`), or the unvested refund returned to the sender (`cancelled`).
 /// * `receiver_amount` is the receiver-side amount paid out by this event: `0`
 ///   (`created`), the withdrawn amount (`withdraw`), or the vested-but-not-yet-
 ///   withdrawn remainder paid out on `cancelled`. For `withdraw` it equals
 ///   `amount`.
+/// * `timestamp` is the ledger time the event was published at, so an indexer
+///   can order lifecycle events and freeze accrual (`cancelled`) without
+///   relying on ledger-close metadata.
 #[contractevent]
 #[derive(Clone)]
 pub struct StreamEvent {
@@ -145,7 +206,10 @@ pub struct StreamEvent {
     pub token: Address,
     pub amount: i128,
     pub receiver_amount: i128,
+    /// Ledger timestamp at which this event was published.
+    pub timestamp: u64,
     pub start_time: u64,
+    pub cliff_time: u64,
     pub end_time: u64,
 }
 
@@ -197,6 +261,11 @@ pub enum Error {
     InvalidAllocation = 18,
     SplitTooManyReceivers = 19,
     BatchTooLarge = 20,
+    /// `start_time` was earlier than the current ledger timestamp.
+    StartTimeInPast = 21,
+    /// `cliff_seconds` exceeded `duration_seconds` (the whole stream would
+    /// unlock only at/after its end).
+    InvalidCliff = 22,
 }
 
 #[contract]
@@ -233,6 +302,9 @@ impl StreamingContract {
     /// Create a stream. `sender` must sign this call and, in the same
     /// transaction, authorize the token pull from their balance into the
     /// contract's own balance. Returns the new stream id.
+    ///
+    /// Signature unchanged from v1: this is exactly
+    /// [`Self::create_stream_scheduled`] with "start now, no cliff".
     pub fn create_stream(
         env: Env,
         sender: Address,
@@ -240,6 +312,50 @@ impl StreamingContract {
         token: Address,
         amount: i128,
         duration_seconds: u64,
+    ) -> u64 {
+        Self::create_stream_scheduled(
+            env,
+            sender,
+            receiver,
+            token,
+            amount,
+            duration_seconds,
+            None,
+            None,
+        )
+    }
+
+    /// Create a stream with an explicit start time and an optional cliff.
+    ///
+    /// * `start_time` — `None` starts at the current ledger timestamp (the v1
+    ///   behaviour). `Some(t)` funds a schedule that begins at `t`. A future
+    ///   `t` is the normal case; a `t` that has already passed is accepted
+    ///   within [`START_TIME_GRACE_SECONDS`] (inclusion lag between signing and
+    ///   the executing ledger), and the stream then accrues from `t` as usual.
+    ///   Older `t` is rejected (`Error::StartTimeInPast`), because a genuinely
+    ///   retroactive start would hand the receiver a stream that is already
+    ///   partly unlocked — the sender could then cancel it and lose nothing,
+    ///   which is not a stream.
+    /// * `cliff_seconds` — `None` means no cliff. `Some(c)` makes nothing
+    ///   vested or payable before `start_time + c`; after the cliff the normal
+    ///   linear schedule from `start_time` applies, so the vested amount jumps
+    ///   to the post-cliff accrual (standard cliff semantics, not a re-base).
+    ///   `c > duration_seconds` is rejected (`Error::InvalidCliff`) because the
+    ///   whole amount would unlock only at or after the end, which is never
+    ///   what the caller meant.
+    ///
+    /// Everything else (pause gate, auth, amount/duration/party validation,
+    /// exact token pull, TTL arming, `created` event) is identical to
+    /// [`Self::create_stream`]. Returns the new stream id.
+    pub fn create_stream_scheduled(
+        env: Env,
+        sender: Address,
+        receiver: Address,
+        token: Address,
+        amount: i128,
+        duration_seconds: u64,
+        start_time: Option<u64>,
+        cliff_seconds: Option<u64>,
     ) -> u64 {
         // FIX (Stage 3): circuit breaker — a paused contract rejects NEW
         // streams only. Existing streams keep vesting, withdrawing, and
@@ -262,9 +378,32 @@ impl StreamingContract {
         }
 
         let now = env.ledger().timestamp();
-        let end_time = match now.checked_add(duration_seconds) {
+        // Phase 1(f): schedule validation. `None` means "start now"; an
+        // explicit start may be in the future, or a few seconds behind `now`
+        // because a transaction can wait a ledger or two between signing and
+        // inclusion (see `START_TIME_GRACE_SECONDS`). A start further back than
+        // the grace window is still rejected — that is a back-dated schedule.
+        let start = match start_time {
+            Some(t) => t,
+            None => now,
+        };
+        if start < now.saturating_sub(START_TIME_GRACE_SECONDS) {
+            panic_with_error!(&env, Error::StartTimeInPast);
+        }
+        let end_time = match start.checked_add(duration_seconds) {
             Some(t) => t,
             None => panic_with_error!(&env, Error::InvalidDuration),
+        };
+        let cliff_secs = match cliff_seconds {
+            Some(c) => c,
+            None => 0,
+        };
+        if cliff_secs > duration_seconds {
+            panic_with_error!(&env, Error::InvalidCliff);
+        }
+        let cliff_time = match start.checked_add(cliff_secs) {
+            Some(t) => t,
+            None => panic_with_error!(&env, Error::InvalidCliff),
         };
 
         // FIX: write state BEFORE the external token call (check-effects-
@@ -279,7 +418,8 @@ impl StreamingContract {
                 receiver: receiver.clone(),
                 token: token.clone(),
                 total_amount: amount,
-                start_time: now,
+                start_time: start,
+                cliff_time,
                 end_time,
                 withdrawn: 0,
                 cancelled: false,
@@ -321,7 +461,9 @@ impl StreamingContract {
             token,
             amount,
             receiver_amount: 0,
-            start_time: now,
+            timestamp: now,
+            start_time: start,
+            cliff_time,
             end_time,
         }
         .publish(&env);
@@ -532,6 +674,8 @@ impl StreamingContract {
                     token: token.clone(),
                     total_amount: shares.get(i).unwrap(),
                     start_time: now,
+                    // Split members have no cliff: the gate is the start time.
+                    cliff_time: now,
                     end_time,
                     withdrawn: 0,
                     cancelled: false,
@@ -579,7 +723,9 @@ impl StreamingContract {
                 token: token.clone(),
                 amount: shares.get(i).unwrap(),
                 receiver_amount: 0,
+                timestamp: now,
                 start_time: now,
+                cliff_time: now,
                 end_time,
             }
             .publish(env);
@@ -610,14 +756,16 @@ impl StreamingContract {
         if stream.receiver != receiver {
             panic_with_error!(&env, Error::Unauthorized);
         }
-        // FIX (Finding 6): surface a clear error for cancelled streams rather
-        // than falling through to `NothingToWithdraw` (post-cancel the
-        // withdrawable amount is always 0).
-        if stream.cancelled {
-            panic_with_error!(&env, Error::StreamCancelled);
-        }
 
         let now = env.ledger().timestamp();
+        // Phase 1(b): `vested_so_far` is cliff-aware and frozen at
+        // `cancelled_at` for a cancelled stream, so this single expression is
+        // correct for active, pre-cliff, and cancelled streams alike. A
+        // cancelled stream has already been settled by `cancel` (which sets
+        // `withdrawn = accrued`), so withdrawing from one falls through to
+        // `NothingToWithdraw` instead of being rejected outright: the vested
+        // portion stays payable by construction, and the maths can never pay
+        // the same vested unit twice.
         let accrued = vested_so_far(&stream, now);
         let withdrawable = accrued - stream.withdrawn;
         if withdrawable <= 0 {
@@ -654,7 +802,9 @@ impl StreamingContract {
             token: stream.token,
             amount: withdrawable,
             receiver_amount: withdrawable,
+            timestamp: now,
             start_time: stream.start_time,
+            cliff_time: stream.cliff_time,
             end_time: stream.end_time,
         }
         .publish(&env);
@@ -717,7 +867,9 @@ impl StreamingContract {
             token: stream.token,
             amount: refund,
             receiver_amount: unwithdrawn,
+            timestamp: now,
             start_time: stream.start_time,
+            cliff_time: stream.cliff_time,
             end_time: stream.end_time,
         }
         .publish(&env);
@@ -791,7 +943,9 @@ impl StreamingContract {
                 token: stream.token.clone(),
                 amount: refund,
                 receiver_amount: unwithdrawn,
+                timestamp: now,
                 start_time: stream.start_time,
+                cliff_time: stream.cliff_time,
                 end_time: stream.end_time,
             }
             .publish(&env);
@@ -946,14 +1100,19 @@ impl StreamingContract {
     }
 
     /// Pro-rata linearly-vested amount as of the current ledger time.
-    /// For a cancelled stream, vesting is frozen at `cancelled_at`.
+    ///
+    /// Returns `0` before the cliff, the linear accrual afterwards, and is
+    /// frozen at `cancelled_at` for a cancelled stream.
     pub fn streamed_amount(env: Env, stream_id: u64) -> i128 {
         let s = Self::load(&env, stream_id);
+        Self::rearm_read_ttl(&env, stream_id);
         vested_so_far(&s, env.ledger().timestamp())
     }
 
     pub fn get_stream(env: Env, stream_id: u64) -> Stream {
-        Self::load(&env, stream_id)
+        let s = Self::load(&env, stream_id);
+        Self::rearm_read_ttl(&env, stream_id);
+        s
     }
 
     /// View the split group rooted at `root_id` (panics `SplitNotFound` if the
@@ -963,12 +1122,18 @@ impl StreamingContract {
     }
 
     /// Amount currently available to withdraw (accrued minus already-withdrawn).
+    /// Always `0` before the cliff and after a cancellation (a cancel settles
+    /// the vested remainder in the same call).
     pub fn get_withdrawable(env: Env, stream_id: u64) -> i128 {
         let s = Self::load(&env, stream_id);
+        Self::rearm_read_ttl(&env, stream_id);
         vested_so_far(&s, env.ledger().timestamp()) - s.withdrawn
     }
 
     pub fn get_stream_count(env: Env) -> u64 {
+        if env.storage().persistent().has(&DataKey::Counter) {
+            Self::bump_ttl(&env, &DataKey::Counter);
+        }
         env.storage().persistent().get(&DataKey::Counter).unwrap_or(0)
     }
 
@@ -1077,22 +1242,56 @@ impl StreamingContract {
     /// at the ceiling" with negligible cost.
     fn bump_instance_ttl(env: &Env) {
         let max = env.storage().max_ttl();
-        env.storage()
-            .instance()
-            .extend_ttl(max.saturating_sub(1), max);
+        env.storage().instance().extend_ttl(
+            max.saturating_sub(INSTANCE_TTL_REARM_MARGIN_LEDGERS),
+            max,
+        );
     }
 
-    /// FIX: extend a persistent entry's TTL so long-running streams don't get
-    /// archived while still active. `set` resets TTL on write, but a stream
-    /// that is only *read* (via views) for longer than `max_ttl` would expire;
-    /// bumping here keeps it alive. (Ledgers ≈ 5s; 30 days ≈ 518_400 ledgers.)
+    /// The `(threshold, extend_to)` pair for [`Self::bump_ttl`], clamped to the
+    /// network ceiling.
+    ///
+    /// Both clamps matter: `extend_ttl` reverts when `extend_to > max_ttl()`
+    /// (the ceiling is a network parameter, so a pinned constant can exceed it)
+    /// and requires `threshold <= extend_to` (which a low ceiling would break).
+    fn ttl_params(env: &Env) -> (u32, u32) {
+        let max = env.storage().max_ttl();
+        let extend_to = TTL_EXTEND_TO_LEDGERS.min(max);
+        let threshold = TTL_THRESHOLD_LEDGERS.min(extend_to);
+        (threshold, extend_to)
+    }
+
+    /// Phase 1(a): extend a persistent entry's lease to
+    /// [`TTL_EXTEND_TO_LEDGERS`] whenever it has dropped below
+    /// [`TTL_THRESHOLD_LEDGERS`]. `set` resets a lease on write, but an entry
+    /// that is only *read* (an indexer polling a long stream, a keeper
+    /// watching a dormant one) would otherwise be archived mid-term and take
+    /// its funds with it. Cheap on the hot path: while the entry is above the
+    /// threshold the host call is a no-op.
     fn bump_ttl(env: &Env, key: &DataKey) {
-        const THIRTY_DAYS_LEDGERS: u32 = 30 * 24 * 60 * 12;
-        env.storage().persistent().extend_ttl(
-            key,
-            THIRTY_DAYS_LEDGERS,
-            env.storage().max_ttl(),
-        );
+        let (threshold, extend_to) = Self::ttl_params(env);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, threshold, extend_to);
+    }
+
+    /// Phase 1(a): re-arm the TTL of everything a read of `stream_id` touches.
+    ///
+    /// Views are normally invoked as simulations, and a simulation never
+    /// commits a TTL extension to the ledger — so this only takes effect when
+    /// the view runs as a real transaction (e.g. another contract calling us
+    /// cross-contract). It is a no-op otherwise, and the permissionless
+    /// `bump` / `bump_many` / `bump_instance` keepers remain the primary re-arm
+    /// path; a read is still the right moment to re-arm, because an entry that
+    /// is read but never written is exactly the one that expires.
+    fn rearm_read_ttl(env: &Env, stream_id: u64) {
+        Self::bump_ttl(env, &DataKey::Stream(stream_id));
+        // Guarded: `extend_ttl` on a missing key traps. A stream existing
+        // implies the counter exists, but `get_stream_count` can be the first
+        // call on a fresh deployment.
+        if env.storage().persistent().has(&DataKey::Counter) {
+            Self::bump_ttl(env, &DataKey::Counter);
+        }
     }
 
     /// FIX (Finding 3): transfer `amount` from the contract to `to` and verify
@@ -1160,6 +1359,15 @@ fn vested_amount(total: i128, start: u64, end: u64, now: u64) -> i128 {
     if now <= start {
         return 0;
     }
+    // Phase 1(d): at or past the end the answer is exactly `total`. The
+    // decomposition below is already exact for `elapsed == duration`, but
+    // stating the end point explicitly is what makes "the stream finishes
+    // with exactly `total` withdrawn" a property of the code rather than of
+    // the arithmetic on any given input, so rounding dust can never leave a
+    // stream permanently one unit short.
+    if now >= end {
+        return total;
+    }
     let t = if now < end { now } else { end };
     let elapsed = (t - start) as i128;
     let duration = (end - start) as i128;
@@ -1182,16 +1390,38 @@ fn vested_amount(total: i128, start: u64, end: u64, now: u64) -> i128 {
     base + frac
 }
 
-/// Amount that has vested as of `now`, respecting the cancellation freeze.
+/// Vesting with a cliff: nothing before `cliff`, the ordinary linear schedule
+/// from `start` afterwards.
 ///
-/// For an active stream this is the pro-rata accrual at `now`. For a cancelled
-/// stream vesting stopped at `cancelled_at`, so the accrual is frozen there
-/// regardless of how much later `now` is.
+/// A cliff is a *gate*, not a re-base — the accrual is not re-based onto the
+/// cliff, so at `cliff` the vested amount jumps to the elapsed-at-cliff share
+/// and then grows linearly to `total` at `end`. `cliff == start` (or `cliff` 0
+/// for a stream starting at 0) is the no-cliff case, which is why every
+/// pre-v5 stream keeps its exact old behaviour.
+fn vested_with_cliff(total: i128, start: u64, cliff: u64, end: u64, now: u64) -> i128 {
+    if now < cliff {
+        return 0;
+    }
+    vested_amount(total, start, end, now)
+}
+
+/// Amount that has vested as of `now`, respecting the cancellation freeze and
+/// the cliff.
+///
+/// For an active stream this is the gated pro-rata accrual at `now`. For a
+/// cancelled stream vesting stopped at `cancelled_at`, so the accrual is frozen
+/// there regardless of how much later `now` is — and if the stream was
+/// cancelled before its cliff, nothing ever vested and this is 0.
+///
+/// This is the single source of truth for every money-moving path (`withdraw`,
+/// `cancel`, `cancel_split`) and every view, which is what keeps
+/// `withdrawn + refunded + remaining == total` true.
 fn vested_so_far(stream: &Stream, now: u64) -> i128 {
     let effective_now = if stream.cancelled { stream.cancelled_at } else { now };
-    vested_amount(
+    vested_with_cliff(
         stream.total_amount,
         stream.start_time,
+        stream.cliff_time,
         stream.end_time,
         effective_now,
     )

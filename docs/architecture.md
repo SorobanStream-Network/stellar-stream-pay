@@ -88,13 +88,14 @@ Persistent storage is keyed through the `DataKey` enum (`#[contracttype]`):
 | `DataKey::Split(u64)` | `SplitGroup` | Split-group index for root stream `id` |
 
 A `Stream` records `sender`, `receiver`, `token`, `total_amount`, `start_time`,
-`end_time`, `withdrawn`, `cancelled`, and `cancelled_at`. Amounts are `i128`
-(base units; stroops for SAC assets) and time is ledger-close time (unix
-seconds).
+`end_time`, `cliff_time`, `withdrawn`, `cancelled`, and `cancelled_at`. Amounts
+are `i128` (base units; stroops for SAC assets) and time is ledger-close time
+(unix seconds). `cliff_time` equals `start_time` for streams with no cliff.
 
-**TTL / leases.** Every persistent entry is TTL-bumped to the network maximum
-on write, and the contract **instance + Wasm code** entries — which are
-*separate* ledger entries — are re-armed on every lifecycle write and via the
+**TTL / leases.** Every persistent entry is TTL-bumped to a 180-day lease on
+write (clamped to the network maximum) and re-armed on read, and the contract
+**instance + Wasm code** entries — which are *separate* ledger entries — are
+re-armed to the network maximum on every lifecycle write and via the
 permissionless keepers `bump(stream_id)` and `bump_instance()`. If either the
 instance or the code entry were archived, the contract could no longer be
 invoked at all, so this is what keeps a long-running (or idle) vault alive.
@@ -106,7 +107,8 @@ track streams without polling storage:
 
 - Topics: `[stream_event, kind, stream_id, sender, receiver]`
   (`kind ∈ {created, withdraw, cancelled}`)
-- Data: `{ token, amount, start_time, end_time }` (map format)
+- Data: `{ token, amount, receiver_amount, timestamp, start_time, cliff_time,
+  end_time }` (map format)
 
 The backend's `/api/events` endpoint queries these via Soroban RPC `getEvents`
 with topic filters.
@@ -119,19 +121,26 @@ The core's safety property, asserted by property-based tests:
 > active, `withdrawable == accrued − withdrawn` with
 > `0 ≤ withdrawn ≤ accrued ≤ total_amount`.
 
-Cancellation freezes vesting at `cancelled_at`; the receiver can still withdraw
-the portion that vested before the freeze.
+Cancellation freezes vesting at `cancelled_at` and settles in the same call:
+the vested remainder goes to the receiver and the unvested remainder back to the
+sender, so after `cancel` `withdrawn == accrued` and a later `withdraw` is a
+no-op (`NothingToWithdraw`).
 
 ### 3.4 Vesting math
 
 ```text
-                  min(now, end) − start
-   accrued(t) = total × ───────────────────   (floored)
-                        end − start
+                          clamp(now, start, end) − start
+   accrued(t) = total × ──────────────────────────────────   (floored)
+                              end − start
+
+   with a cliff: accrued(t) = 0 for t < cliff, then the line above
 ```
 
-`vested_amount` is a pure function, so the `proptest` suite verifies it is
-bounded, monotonic in time, and an exact floor division.
+A cliff is a **gate, not a re-base**: the schedule still runs from `start_time`,
+so at `cliff_time` the pre-cliff portion unlocks at once. `vested_amount` is a
+pure function, so the `proptest` suite verifies it is bounded, monotonic in
+time, zero before the cliff, exactly `total` at/after the end, and an exact
+floor division.
 
 ---
 
