@@ -3,11 +3,13 @@ import { StreamCard } from "./StreamCard";
 
 /**
  * Panel listing every stream for the connected wallet, with loading and empty
- * states. Delegate per-stream rendering to {@link StreamCard}.
+ * states. Delegate per-stream rendering to {@link StreamCard}, passing the
+ * shared ticking `now` so every card updates from one clock.
  */
 export function StreamList({
   streams,
   walletAddress,
+  now,
   loading,
   busyId,
   cancellingId,
@@ -16,6 +18,7 @@ export function StreamList({
 }: {
   streams: Stream[];
   walletAddress: string;
+  now: number;
   loading: boolean;
   busyId: number | null;
   cancellingId: number | null;
@@ -35,6 +38,7 @@ export function StreamList({
             key={stream.id}
             stream={stream}
             walletAddress={walletAddress}
+            now={now}
             busyId={busyId}
             cancellingId={cancellingId}
             onWithdraw={onWithdraw}

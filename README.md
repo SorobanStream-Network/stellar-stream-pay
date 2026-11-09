@@ -49,7 +49,7 @@ Contracts (SAC) and custom tokens.
 ```text
                           ┌─────────────────────────────┐
                           │       Employer (sender)     │
-                          │     Freighter wallet (G…)   │
+                          │      Stellar wallet (G…)    │
                           └──────────────┬──────────────┘
                                          │  create_stream(token, amount, duration)
                                          │  require_auth(sender) · locks tokens
@@ -81,14 +81,17 @@ Contracts (SAC) and custom tokens.
 
 - **Contract** (`contracts/core/`) — holds locked funds and enforces the linear vesting
   schedule. Emits `created`, `withdrawn`, and `cancelled` events for indexers.
-- **Backend** (`backend/`) — Express API that maintains an in-memory index of
-  stream state from the contract's `created`/`withdrawn`/`cancelled` events
-  (seed + `getEvents` poll; see `backend/src/indexer.js`), plus Horizon classic
-  balances, serving the frontend with decorated stream data (`accrued`,
-  `withdrawable`, `progress`).
-- **Frontend** (`frontend/`) — Freighter wallet integration; builds, simulates,
-  assembles, signs, and submits `create_stream` / `withdraw` / `cancel`
-  transactions with `@stellar/stellar-sdk`.
+- **Backend** (`backend/`) — Express API over a **SQLite** event index
+  (`backend/src/db.js`, `indexer.js`): contract events are folded into
+  `streams`/`events` tables and the ledger cursor is checkpointed after every
+  page, so the index is backfilled once, survives restarts, and resumes instead
+  of re-seeding. Serves `/api/streams`, `/api/stream/:address` (keyset
+  pagination), `/api/events`, an SSE stream (`/api/events/stream`), and Horizon
+  classic balances, with validated queries and rate limiting.
+- **Frontend** (`frontend/`) — React dashboard with **Stellar Wallets Kit**
+  (Freighter, xBull, Albedo, Lobstr, Rabet, …); builds, simulates, assembles,
+  signs, and submits `create_stream` / `withdraw` / `cancel` transactions with
+  `@stellar/stellar-sdk`, and ticks accrued balances client-side between polls.
 
 ## Features
 
@@ -103,11 +106,15 @@ Contracts (SAC) and custom tokens.
   created or destroyed across create/withdraw/cancel scenarios.
 - ⛓️ **SAC & SEP-41 native** — streams any token through the standard token
   interface; no separate mint/clawback/admin logic.
-- 🗂️ **Node indexer / API** — maintains an in-memory index of stream state from
-  the contract's lifecycle events (seed + `getEvents` poll), plus Horizon account
-  balances, with computed accrual/withdrawable/progress.
-- ⚛️ **React + Freighter DApp** — connect wallet, create streams, withdraw accrued
-  amounts, and cancel streams from a clean dashboard.
+- 🗂️ **Durable event index / API** — folds the contract's lifecycle events into
+  SQLite with a ledger-cursor checkpoint (backfill on first boot, resume on
+  restart), serves paginated, validated queries, and pushes live updates over
+  SSE, alongside Horizon account balances and computed
+  accrual/withdrawable/progress.
+- ⚛️ **React + Stellar Wallets Kit DApp** — connect any major Stellar wallet,
+  create streams with a human amount and a date/duration picker, watch the
+  accrued balance tick in real time, and withdraw or cancel from a clean
+  dashboard.
 - 📡 **Lifecycle events** — `created` / `withdrawn` / `cancelled` topics for
   event-based indexing and notifications.
 - 🔋 **Rent-bumped leases** — persistent entries, the contract instance, and the
@@ -116,7 +123,7 @@ Contracts (SAC) and custom tokens.
   `bump_instance`), so
   long-running streams and an idle vault are never archived.
 - 🛡️ **Pre-flight + decoded errors** — every wallet action is validated (wallet
-  ready, gas, token balance, receiver trustline) *before* the Freighter dialog,
+  ready, gas, token balance, receiver trustline) *before* the wallet dialog,
   and raw Soroban `HostError`/contract codes are decoded into human-readable
   messages.
 
@@ -132,11 +139,14 @@ stellar-stream-pay/
 │       ├── Cargo.toml      #     stream-core package (soroban-sdk, proptest)
 │       └── test_snapshots/ #     committed SDK snapshot tests
 ├── backend/                # Node.js / Express indexer & API
-│   ├── src/index.js        #   API routes (served from the event index)
-│   ├── src/indexer.js      #   in-memory event index (seed + getEvents poll)
+│   ├── src/app.js          #   Express app: routes, zod validation, rate limits, SSE
+│   ├── src/db.js           #   SQLite store: event fold, cursor checkpoint, queries
+│   ├── src/indexer.js      #   Soroban RPC → SQLite indexer (backfill, resume, poll)
+│   ├── src/sse.js          #   SSE hub for live stream updates
+│   ├── src/index.js        #   server bootstrap (startServer)
 │   ├── src/keeper.js       #   TTL relayer: bump / bump_many / bump_instance
-│   └── Dockerfile          #   container image
-├── frontend/               # React / Vite DApp with Freighter wallet
+│   └── Dockerfile          #   container image (SQLite volume at /data)
+├── frontend/               # React / Vite DApp (Stellar Wallets Kit)
 │   ├── src/App.tsx         #   dashboard: view/manage streams, trigger actions
 │   ├── src/lib/stellar/    #   wallet, rpc, tx, error-decoding, pre-flight helpers
 │   ├── src/lib/contracts/  #   stream-core client (invoke + TTL keepers)
@@ -159,8 +169,8 @@ stellar-stream-pay/
 |------|-----|---------|
 | [Rust](https://rustup.rs) | build the contract | 1.84+ |
 | [`stellar-cli`](https://developers.stellar.org/docs/tools/developer-tools/cli) | build/deploy contracts | latest |
-| [Node.js](https://nodejs.org) | backend + frontend | 20+ (22 recommended) |
-| [Freighter](https://freighter.app) | browser wallet for signing | latest |
+| [Node.js](https://nodejs.org) | backend + frontend | 22+ |
+| [A Stellar wallet](https://stellar.org/ecosystem/wallets) | signing (Freighter, xBull, Albedo, …) | latest |
 
 Install `stellar-cli`:
 
@@ -173,7 +183,7 @@ Verify:
 ```bash
 rustc --version      # >= 1.84
 stellar --version
-node --version       # >= 20
+node --version       # >= 22
 ```
 
 ## Quick start
@@ -220,10 +230,18 @@ The server listens on `http://localhost:4000`:
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | RPC connectivity + network info |
-| `GET /api/stream/:address` | Streams where `:address` is sender or receiver (Soroban RPC) |
+| `GET /health` | Liveness, network, and index stats (streams/events/cursor/seeded), SSE clients |
+| `GET /api/streams` | All indexed streams, newest first (`?limit=`, `?cursor=`) |
+| `GET /api/stream/:address` | Streams where `:address` is sender or receiver (`?limit=`, `?cursor=`) |
 | `GET /api/account/:address` | Classic/SAC balances for an address (Horizon) |
-| `GET /api/events` | Lifecycle events (`created` / `withdraw` / `cancelled`) for the contract |
+| `GET /api/events` | Indexed lifecycle events (`created` / `withdraw` / `cancelled`), `?seq=` cursor |
+| `GET /api/events/stream` | Server-Sent Events: live lifecycle updates (exempt from rate limits) |
+
+Addresses are validated (56-char `G…`), `limit` is clamped to 1–100, and read
+routes are rate-limited to `RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW_MS` (default
+240/min). The index lives in `DATABASE_PATH` (default `data/streams.db`,
+`/data/streams.db` in the image) — keep that file (or volume) across restarts
+and the indexer resumes from its cursor instead of re-backfilling.
 
 ```bash
 curl http://localhost:4000/api/stream/GBVZ...YOUR...ADDRESS
@@ -240,11 +258,13 @@ npm run dev                   # http://localhost:5173
 
 With the backend running (`VITE_BACKEND_URL`):
 
-1. Click **Connect Freighter**.
-2. **Create a stream** — enter a receiver, the SAC/token contract id, the amount
-   in base units, and a duration in seconds.
+1. Click **Connect wallet** and pick any Stellar Wallets Kit wallet.
+2. **Create a stream** — enter a receiver, the token contract id, the amount in
+   the token's own units (the dashboard reads its symbol and decimals), a
+   duration with a unit, and optionally a start time and a cliff.
 3. Streams where you are the receiver show a **Withdraw** button once something
-   has vested; streams you sent show a **Cancel** button.
+   has vested (the accrued figure ticks live between polls); streams you sent
+   show a **Cancel** button.
 
 ### 4. Run with Docker
 
@@ -257,7 +277,9 @@ VITE_CONTRACT_ID=C... docker compose up --build
 
 Serves the backend on `http://localhost:4000` and the frontend (with
 `VITE_CONTRACT_ID` baked in at build time) on `http://localhost:8080`. All env
-vars have Testnet defaults — see the `.env.example` files.
+vars have Testnet defaults — see the `.env.example` files. The backend's event
+index is persisted on the named `backend-data` volume, so it survives
+`docker compose up --build`; remove the volume to force a full re-seed.
 
 ### 5. Run the TTL keeper (relayer)
 
@@ -343,7 +365,8 @@ container, or scrape the host directly) and alert on:
 
 | Function | Auth | Description |
 |----------|------|-------------|
-| `create_stream(sender, receiver, token, amount, duration_seconds) -> u64` | `sender` | Locks `amount` (base units) from `sender` and starts a stream. |
+| `create_stream(sender, receiver, token, amount, duration_seconds) -> u64` | `sender` | Locks `amount` (base units) from `sender` and starts a stream. Exact alias of `create_stream_scheduled(.., None, None)` (start now, no cliff). |
+| `create_stream_scheduled(sender, receiver, token, amount, duration_seconds, start_time: Option<u64>, cliff_seconds: Option<u64>) -> u64` | `sender` | Same, with an optional future `start_time` and an optional cliff. Nothing is withdrawable before `start_time + cliff_seconds`; the cliff gates the unlock without re-basing the schedule. |
 | `withdraw(receiver, stream_id) -> i128` | `receiver` | Pays out the currently accrued (un-withdrawn) amount. |
 | `cancel(caller, stream_id) -> i128` | `sender` or `receiver` | Settles the stream: pays the vested remainder to the receiver and refunds the unvested remainder to the sender. |
 | `get_stream(stream_id) -> Stream` | — | Read a stream. |
@@ -369,10 +392,15 @@ The backend reads both directly via RPC `getContractData`.
   SEP-41 `token::Client`, which enforces its own auth.
 - **Input guards** — `InvalidDuration` rejects `duration_seconds == 0` *before*
   any storage write (no divide-by-zero in vesting math); `InvalidAmount` rejects
-  non-positive amounts; `InvalidParties` rejects sender == receiver; a missing
-  stream id returns `StreamNotFound` and a second `withdraw` on a fully-drawn
-  stream returns `NothingToWithdraw` / `StreamCancelled` — clean `Error` codes,
-  never panics.
+  non-positive amounts; `InvalidParties` rejects sender == receiver;
+  `StartTimeInPast` rejects a backwards-dated schedule (anything more than two
+  minutes behind the executing ledger — `START_TIME_GRACE_SECONDS` — so ordinary
+  inclusion lag is tolerated) and `InvalidCliff` rejects
+  `cliff_seconds > duration_seconds`; a missing stream id returns
+  `StreamNotFound`, and a second `withdraw` on a fully-drawn stream returns
+  `NothingToWithdraw` — including a stream cancelled earlier, since `cancel`
+  settles the vested remainder in the same call. Clean `Error` codes, never
+  panics.
 - **Check-effects-interactions** — stream state is updated *before* external token
   calls, and arithmetic overflow traps (rather than wraps) via
   `overflow-checks = true` in the release profile (contract `Cargo.toml`).
@@ -384,18 +412,26 @@ The backend reads both directly via RPC `getContractData`.
   works for SAC-wrapped native assets and custom tokens alike. The admin-only
   `token::StellarAssetClient` (mint/clawback) is intentionally unused.
 - **Frontend signing** — transactions are simulated + assembled via
-  `prepareTransaction` (so auth entries and footprints are correct) before Freighter
-  signs; the app never touches private keys.
+  `prepareTransaction` (so auth entries and footprints are correct) before the
+  wallet signs; the app never touches private keys.
+- **Network guard** — the dashboard compares the RPC network *and* the wallet's
+  connected network against `VITE_NETWORK_PASSPHRASE` and blocks writes with an
+  explicit banner on mismatch, so a Testnet session cannot be signed against
+  Mainnet.
 - **Pre-flight validation** — wallet readiness, gas, token balance, and receiver
   trustlines are checked before the wallet dialog; simulation and submission
   errors are decoded into readable messages (`decodeSorobanError`).
 - **Rent bumping** — `create`/`withdraw`/`cancel`/`bump`/`bump_many`/`bump_instance` extend
-  the persistent entries *and* the contract instance/code TTL to the network
-  maximum, so neither streams nor the vault are archived mid-term.
-- **Indexer scaling** — the backend maintains an in-memory index of stream state
-  by seeding once and polling the contract's `created` / `withdrawn` / `cancelled`
-  events (`getEvents`) forward, so `/api/streams` and `/api/stream/:address` are
-  served from the index instead of scanning storage ids `0..count` per request.
+  the persistent entries to a 180-day lease (`TTL_EXTEND_TO_LEDGERS`, clamped to
+  the network maximum) and read paths re-arm them too, while the contract
+  instance/code entries go to the network maximum, so neither streams nor the
+  vault are archived mid-term.
+- **Indexer durability** — the backend folds the contract's `created` /
+  `withdrawn` / `cancelled` events into SQLite and checkpoints a ledger cursor
+  after every page, so `/api/streams` and `/api/stream/:address` are served from
+  the database (keyset paginated) instead of scanning storage ids `0..count`,
+  and a restart resumes rather than re-scanning. Event ids are unique, so
+  replaying a page after a crash is a no-op.
 
 See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
 
@@ -404,7 +440,7 @@ See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
 The repo is verified at every layer — CI (`.github/workflows/`) runs all of
 this on every push:
 
-**Contract (`cargo test -p stream-core` from `contracts/`) — 66 tests:**
+**Contract (`cargo test -p stream-core` from `contracts/`) — 80 tests:**
 
 - **Vesting math** — property tests (`proptest`) randomize the time-weighted
   accrual formula across thousands of cases (`vested_amount_is_bounded`,
@@ -418,19 +454,33 @@ this on every push:
   `pause_requires_admin_auth`).
 - **Edge cases** — zero amount/duration, sender == receiver, double-cancel,
   nothing-to-withdraw, fee-on-transfer tokens, TTL re-arming, pause gating,
-  and split-stream bounds.
+  split-stream bounds, scheduled starts (including the two-minute past-start
+  grace boundary), and cliff gating without re-basing.
 - Committed SDK snapshots (`test_snapshots/`) pin exact storage/event behavior.
 
-**Backend (`cd backend && npm test`) — 23 tests (`node:test`, zero new deps):**
+**Backend (`cd backend && npm test`) — 31 tests (`node:test`, zero new deps):**
 
 - **TTL keeper** — `bump_many` batching with per-stream fallback, dry-run,
   per-item error isolation, archived-entry skipping.
 - **Monitoring** — health/status endpoints and Prometheus metrics accumulation.
-- **Event indexer** — fold/seed/backfill/poll semantics and enrich math.
+- **Event indexer** — fold/seed/backfill/poll semantics, cursor checkpoint and
+  resume across a real SQLite restart, and enrich math.
+- **API** — paginated routes, address/limit validation, 503 before the seed
+  completes, 429 rate limiting, and the SSE handshake + fan-out (real loopback
+  HTTP, mocked RPC).
+- **Bootstrap** — `startServer` boots against an in-memory store and serves
+  `/health` and `/api/stream/:address`.
 
-**Frontend (`cd frontend && npx tsc -b`) — typechecks clean**, and the error
-decoder smoke tests cover every contract code, host failure, Freighter
-rejection, and network error shape.
+**Frontend (`cd frontend && npm test`) — 20 Vitest tests:**
+
+- **Accrual** (`lib/accrual.ts`) — bounded, monotonic, exact at the end, zero
+  before a cliff, the pre-cliff portion unlocking at once, and cancellation
+  freezing accrual at the freeze time.
+- **Formatting** (`lib/format.ts`) — grouped and shortened amounts, BigInt-exact
+  `parseUnits`/`formatUnits` round-trips (including too-many-decimals
+  rejection), durations, and `datetime-local` round-trips.
+
+`npm run build` (`tsc -b && vite build`) typechecks the whole app.
 
 ## Networks
 
@@ -447,12 +497,13 @@ point at the same network as `VITE_RPC_URL`), and `VITE_NETWORK_PASSPHRASE`
 - [x] Property-based invariant tests (proptest) + settlement-invariant suite
 - [x] `stream-core` v1 extracted to `contracts/core/` as a frozen, composable workspace member
 - [x] Express indexer / API (Soroban RPC + Horizon)
-- [x] React + Freighter dashboard (connect, create, withdraw, cancel)
+- [x] React dashboard (connect, create, withdraw, cancel)
 - [x] **Split streams** — fan one stream out to multiple receivers (`create_split_stream` / `_bps` / `_pct`, `cancel_split`, `get_split`)
 - [ ] **Dependency streams** — payer → sub-payee chains (multi-tier payroll)
-- [x] Event-based indexing — backend folds `created`/`withdrawn`/`cancelled` (+ split) events into an in-memory index (`/api/streams`, `/api/stream/:address`) instead of the per-request id-scan
+- [x] Event-based indexing — backend folds `created`/`withdrawn`/`cancelled` (+ split) events into a SQLite-persisted index with a ledger cursor (backfill on first boot, resume on restart), served paginated with live SSE updates, instead of the per-request id-scan
+- [x] Wallet choice beyond Freighter — Stellar Wallets Kit (xBull, Albedo, Lobstr, Rabet, …)
 - [x] TTL keeper relayer — permissionless `bump`/`bump_many`/`bump_instance` on a schedule, with pass status + Prometheus metrics
-- [ ] Token metadata display (symbol + decimals) in the dashboard
+- [x] Token metadata (symbol + decimals), human amount entry, date/duration pickers, and live ticking accrued balances in the dashboard
 - [ ] Relayer / gasless withdrawals for receivers
 - [ ] Mainnet deployment + third-party audit
 

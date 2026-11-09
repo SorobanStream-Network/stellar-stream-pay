@@ -7,6 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned Stellar CLI. Note the release tag is `v<version>` while the asset
+  # filename has no `v`. The CLI decides the optimization / spec-shaking
+  # pipeline that turns the crate into the Wasm you actually deploy, so bump
+  # this deliberately rather than floating on `latest`.
+  STELLAR_CLI_VERSION: 30.0.1
 
 jobs:
   contract:
@@ -41,5 +46,35 @@ jobs:
       - name: Test
         run: cargo test -p stream-core
 
-      - name: Build (Soroban Wasm target)
-        run: cargo build -p stream-core --target wasm32v1-none --release
+      # `stellar contract build` is what produces the deployable artifact: it
+      # runs `cargo rustc --crate-type=cdylib --target=wasm32v1-none --release`
+      # and then applies the SDK's optimization + spec-shaking pass
+      # (~29 KB -> ~26 KB), which a plain `cargo build` skips. Install the
+      # pinned prebuilt binary instead of compiling the CLI (that would add
+      # several minutes per run).
+      - name: Install Stellar CLI
+        working-directory: .
+        run: |
+          set -euo pipefail
+          bin_dir="$HOME/.local/bin"
+          mkdir -p "$bin_dir"
+          curl -fsSL -o /tmp/stellar-cli.tar.gz \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          tar xzf /tmp/stellar-cli.tar.gz -C "$bin_dir" stellar
+          echo "$bin_dir" >> "$GITHUB_PATH"
+          "$bin_dir/stellar" --version
+
+      - name: Build (Soroban Wasm, optimized)
+        run: stellar contract build
+
+      # Publish the deployable artifact so a deploy job (or a human) picks up
+      # exactly the Wasm this run produced instead of rebuilding locally.
+      # `path` is repo-root-relative: the job-level `defaults.run
+      # .working-directory` applies to `run:` steps only, not to `uses:`.
+      - name: Upload Wasm artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: stream-core-wasm
+          path: contracts/target/wasm32v1-none/release/stream_core.wasm
+          if-no-files-found: error
+          retention-days: 14

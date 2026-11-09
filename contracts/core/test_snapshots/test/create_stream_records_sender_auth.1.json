@@ -258,7 +258,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 3110400
       },
       {
         "entry": {
@@ -318,6 +318,14 @@
                     },
                     "val": {
                       "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "cliff_time"
+                    },
+                    "val": {
+                      "u64": "1000000"
                     }
                   },
                   {
@@ -382,7 +390,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6311999
+        "live_until": 3110400
       },
       {
         "entry": {
@@ -460,6 +468,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "cliff_time"
+                  },
+                  "val": {
+                    "u64": "1000000"
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "end_time"
                   },
                   "val": {
@@ -477,6 +493,14 @@
                 {
                   "key": {
                     "symbol": "start_time"
+                  },
+                  "val": {
+                    "u64": "1000000"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "timestamp"
                   },
                   "val": {
                     "u64": "1000000"

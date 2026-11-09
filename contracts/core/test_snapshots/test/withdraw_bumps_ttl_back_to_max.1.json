@@ -112,7 +112,7 @@
   ],
   "ledger": {
     "protocol_version": 27,
-    "sequence_number": 6311899,
+    "sequence_number": 3110300,
     "timestamp": 1000050,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
@@ -178,7 +178,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12623898
+        "live_until": 9422299
       },
       {
         "entry": {
@@ -232,7 +232,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6315994
+        "live_until": 3114395
       },
       {
         "entry": {
@@ -259,7 +259,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6315994
+        "live_until": 3114395
       },
       {
         "entry": {
@@ -282,7 +282,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6315994
+        "live_until": 3114395
       },
       {
         "entry": {
@@ -330,7 +330,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12623898
+        "live_until": 6220700
       },
       {
         "entry": {
@@ -390,6 +390,14 @@
                     },
                     "val": {
                       "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "cliff_time"
+                    },
+                    "val": {
+                      "u64": "1000000"
                     }
                   },
                   {
@@ -454,7 +462,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12623898
+        "live_until": 6220700
       },
       {
         "entry": {
@@ -477,7 +485,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12623898
+        "live_until": 9422299
       },
       {
         "entry": {
@@ -491,7 +499,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 12623898
+        "live_until": 9422299
       }
     ]
   },
