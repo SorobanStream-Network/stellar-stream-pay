@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
-  "description": "Express indexer & API for StellarStream-Pay — reads stream state from Soroban RPC and account balances from Horizon.",
+  "description": "SQLite-backed event indexer & Express API for StellarStream-Pay — persists contract events and serves stream state to the frontend.",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -14,12 +14,15 @@
     "test": "node --test \"test/**/*.test.mjs\""
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.0.0",
+    "better-sqlite3": "^13.0.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.7.3",
+    "zod": "^4.6.7"
   }
 }

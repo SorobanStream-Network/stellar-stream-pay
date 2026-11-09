@@ -1,34 +1,28 @@
 /**
- * Event-based stream indexer for the StellarStream-Pay backend.
+ * Event-based stream indexer (SQLite-backed).
  *
- * The contract publishes a `StreamEvent` (`created` / `withdraw` / `cancelled`)
- * and a `SplitEvent` (`split_created`) on every state change. Soroban RPC has
- * no websocket push, so indexers poll `getEvents` and fold each event into
- * their own state — this module does exactly that, in memory, and serves the
- * `/api/streams` / `/api/stream/:address` routes from the folded state instead
- * of scanning storage ids `0..count` on every request.
+ * Soroban RPC has no websocket push and only retains events for a bounded
+ * ledger window, so the indexer:
  *
- * Streams are never deleted, so the fold is append-only state updates:
+ *   1. **Seeds once** — either by scanning contract storage for `0..count`
+ *      (exact, the default) or by walking `getEvents` forward from
+ *      `INDEX_START_LEDGER` (best-effort, for contracts whose history predates
+ *      RPC retention).
+ *   2. **Persists** every folded event and the forward `cursor` in SQLite, so a
+ *      restart resumes from the last ledger page it saw instead of re-reading
+ *      history it can no longer reach.
+ *   3. **Polls forward** from that cursor, folding `created` / `withdraw` /
+ *      `cancelled` / `split_created` events into the stream table and pushing
+ *      each new one to the SSE hub.
  *
- *   created    -> { sender, receiver, token, total, start, end, cliff,
- *                   withdrawn: 0, cancelled: false }
- *                 (`cliff` defaults to `start` for events published before the
- *                 schedule upgrade, so the fold is correct for both eras)
- *   withdraw   -> withdrawn += receiver_amount   (== amount for single streams)
- *   cancelled  -> cancelled = true; withdrawn += receiver_amount
- *                 (the contract sets withdrawn = accrued on cancel, so after
- *                 the fold `withdrawn` is the vested-at-freeze amount — the
- *                 frozen accrued for a cancelled stream)
- *   split_created -> { root_id, sender, token, member_ids, total_amount }
+ * The fold mirrors the contract:
  *
- * Backfill modes (env, see index.js):
- *   * default            — seed once from a storage scan (one batch of
- *                          getContractData), then maintain via events forward.
- *   * INDEX_START_LEDGER — pure event backfill from that ledger (windowed
- *                          getEvents walk), then maintain via events forward.
- *
- * Both modes are cursor-based going forward, so a stream created while the
- * process is down is picked up on the next poll.
+ *   created       -> insert the stream (withdrawn 0, cancelled false)
+ *   withdraw      -> withdrawn += receiver_amount
+ *   cancelled     -> withdrawn += receiver_amount, cancelled = true
+ *                    (the contract sets withdrawn = accrued, so the folded
+ *                    total is the exact vested-at-freeze amount)
+ *   split_created -> record group membership
  */
 import { nativeToScVal, scValToNative, xdr } from "@stellar/stellar-sdk";
 
@@ -44,8 +38,7 @@ const streamKey = (id) =>
   ]);
 
 // ---------------------------------------------------------------------------
-// Event query + decode (the raw layer shared by backfill, polling, and the
-// `/api/events` route).
+// Event query + decode (raw layer shared by backfill, polling, /api/events)
 // ---------------------------------------------------------------------------
 
 const EVENT_KINDS = ["created", "withdraw", "cancelled"];
@@ -95,6 +88,7 @@ export function decodeEvent(e) {
     token: value.token,
     amount: String(value.amount),
     receiver_amount: value.receiver_amount != null ? String(value.receiver_amount) : null,
+    timestamp: value.timestamp != null ? String(value.timestamp) : null,
     start_time: value.start_time != null ? String(value.start_time) : null,
     end_time: value.end_time != null ? String(value.end_time) : null,
     cliff_time: value.cliff_time != null ? String(value.cliff_time) : null,
@@ -143,88 +137,26 @@ export async function queryContractEvents({ rpc, contractId, startLedger, cursor
 }
 
 // ---------------------------------------------------------------------------
-// Index state + fold
-// ---------------------------------------------------------------------------
-
-/** Fresh, empty index state. */
-export function createStreamIndex() {
-  return {
-    streams: new Map(), // id -> folded stream state (BigInt amounts/times)
-    splits: new Map(), // root_id -> split group metadata
-    cursor: null, // forward getEvents cursor
-    seeded: false,
-    seedError: null,
-    lastPollAt: null,
-    counts: { created: 0, withdraw: 0, cancelled: 0, split_created: 0 },
-  };
-}
-
-/**
- * Fold one decoded event into the index. Idempotent per stream id: streams are
- * only ever created once, and withdraw/cancelled events accumulate onto the
- * existing entry. Unknown kinds / unknown stream ids are ignored defensively.
- */
-export function foldEvent(index, e) {
-  index.counts[e.kind] = (index.counts[e.kind] ?? 0) + 1;
-  if (e.kind === "created") {
-    index.streams.set(e.stream_id, {
-      id: e.stream_id,
-      sender: e.sender,
-      receiver: e.receiver,
-      token: e.token,
-      total_amount: BigInt(e.amount),
-      start_time: BigInt(e.start_time),
-      end_time: BigInt(e.end_time),
-      // Absent on `created` events from before the schedule upgrade; a stream
-      // with no cliff has `cliff_time == start_time`, so the default is exact.
-      cliff_time: e.cliff_time != null ? BigInt(e.cliff_time) : BigInt(e.start_time),
-      withdrawn: 0n,
-      cancelled: false,
-      cancelled_at: 0n,
-    });
-  } else if (e.kind === "withdraw") {
-    const s = index.streams.get(e.stream_id);
-    if (s) s.withdrawn += BigInt(e.receiver_amount ?? e.amount ?? 0);
-  } else if (e.kind === "cancelled") {
-    const s = index.streams.get(e.stream_id);
-    if (s) {
-      s.cancelled = true;
-      // Contract sets withdrawn = accrued on cancel; receiver_amount is the
-      // vested-but-unwithdrawn remainder paid out, so this lands on the exact
-      // frozen accrued amount.
-      s.withdrawn += BigInt(e.receiver_amount ?? 0);
-    }
-  } else if (e.kind === "split_created") {
-    index.splits.set(e.root_id, {
-      root_id: e.root_id,
-      sender: e.sender,
-      token: e.token,
-      member_ids: e.member_ids,
-      total_amount: e.total_amount != null ? BigInt(e.total_amount) : null,
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Backfill + forward polling
+// Backfill + forward polling (all state lands in SQLite)
 // ---------------------------------------------------------------------------
 
 /**
  * Seed the index once from a storage scan (ids `0..count` via getContractData).
- * Used when `INDEX_START_LEDGER` is unset: it is a one-time backfill, not the
- * per-request scan the event index replaces. Throws on RPC failure so the
+ * Used when there is no persisted cursor and `INDEX_START_LEDGER` is unset: it
+ * is a one-time backfill, not a per-request scan. Throws on RPC failure so the
  * caller can retry.
  */
-export async function seedFromStorage({ rpc, contractId, index }) {
+export async function seedFromStorage({ rpc, contractId, store }) {
   const counterRes = await rpc.getContractData(contractId, COUNTER_KEY, "persistent");
   const counterScv = counterRes.val?.value()?.val();
   const count = counterScv ? Number(scValToNative(counterScv)) : 0;
+  let inserted = 0;
   for (let id = 0; id < count; id++) {
     const res = await rpc.getContractData(contractId, streamKey(id), "persistent");
     const scv = res.val?.value()?.val();
     if (!scv) continue; // archived/missing entry
     const raw = scValToNative(scv);
-    index.streams.set(id, {
+    store.seedStream({
       id,
       sender: raw.sender,
       receiver: raw.receiver,
@@ -232,61 +164,79 @@ export async function seedFromStorage({ rpc, contractId, index }) {
       total_amount: raw.total_amount,
       start_time: raw.start_time,
       end_time: raw.end_time,
-      // Entries written before the schedule upgrade have no `cliff_time`.
+      // Pre-upgrade entries have no `cliff_time` (== start_time).
       cliff_time: raw.cliff_time ?? raw.start_time,
       withdrawn: raw.withdrawn,
       cancelled: raw.cancelled,
       cancelled_at: raw.cancelled_at,
     });
-    index.counts.created += 1;
+    inserted += 1;
   }
-  index.seeded = true;
+  return { streams: inserted };
 }
 
 /**
  * Pure event backfill: walk getEvents forward from `startLedger` in ~10k-ledger
  * windows (getEvents scans a bounded range per request and caps results at 100
- * events), folding everything into the index. Stops once the window start
- * passes the RPC's latest ledger. Used when `INDEX_START_LEDGER` is set;
- * best-effort (a window with more than 100 matching events is partially
- * captured — the default storage-seed mode is exact). Bounded by `maxPages`.
+ * events), folding everything into the store and checkpointing the cursor as it
+ * goes. Best-effort: a window with more than 100 matching events is partially
+ * captured — the default storage-seed mode is exact. Bounded by `maxPages`.
  */
-export async function backfillFromEvents({ rpc, contractId, index, startLedger, maxPages = 5000 }) {
+export async function backfillFromEvents({ rpc, contractId, store, startLedger, maxPages = 5000 }) {
   const WINDOW = 10_000;
   let start = startLedger;
+  let folded = 0;
   for (let page = 0; page < maxPages; page++) {
     const res = await queryContractEvents({ rpc, contractId, startLedger: start, limit: 100 });
-    for (const e of res.events) foldEvent(index, e);
-    if (res.cursor) index.cursor = res.cursor;
+    for (const e of res.events) {
+      if (store.applyEvent(e).inserted) folded += 1;
+    }
+    if (res.cursor) store.setCursor(res.cursor);
     if (start > res.latestLedger) break; // walked past the head — done
     start += WINDOW;
   }
-  index.seeded = true;
-}
-
-/** One forward poll from the stored cursor; folds whatever is new. */
-export async function pollForward({ rpc, contractId, index }) {
-  const res = await queryContractEvents({ rpc, contractId, cursor: index.cursor ?? undefined, limit: 100 });
-  for (const e of res.events) foldEvent(index, e);
-  if (res.cursor) index.cursor = res.cursor;
-  index.lastPollAt = new Date().toISOString();
-  return res.events.length;
+  return { folded };
 }
 
 /**
- * Start the indexer: seed once (storage scan by default, or event backfill
- * from `startLedger` when > 0), then poll forward every `pollMs`. Failures are
- * logged and retried — a broken poll never crashes the API. Returns
- * `{ index, stop }` so the caller can shut the loop down (tests, graceful
- * shutdown).
+ * One forward poll from the persisted cursor, folding whatever is new and
+ * pushing each newly folded event to `onEvent` (the SSE hub). Returns the number
+ * of events folded.
+ */
+export async function pollForward({ rpc, contractId, store, onEvent }) {
+  const res = await queryContractEvents({
+    rpc,
+    contractId,
+    cursor: store.getCursor() ?? undefined,
+    limit: 100,
+  });
+  let folded = 0;
+  for (const e of res.events) {
+    if (!store.applyEvent(e).inserted) continue; // replay of an overlapping page
+    folded += 1;
+    onEvent?.(e);
+  }
+  if (res.cursor) store.setCursor(res.cursor);
+  store.setMeta("lastPollAt", new Date().toISOString());
+  return folded;
+}
+
+/**
+ * Start the indexer: resume from the persisted cursor when there is one,
+ * otherwise seed (storage scan by default, or event backfill from
+ * `startLedger`), then poll forward every `pollMs`.
+ *
+ * Failures are logged and retried — a broken poll never crashes the API. The
+ * returned `stop()` clears the timer.
  */
 export function startIndexer({
   rpc,
   contractId,
-  index = createStreamIndex(),
+  store,
   startLedger = 0,
   pollMs = 15_000,
   logger = console,
+  onEvent = () => {},
 }) {
   // Guard against concurrent seeds (e.g. a poll firing while the startup
   // backfill is still running) by memoizing the in-flight promise.
@@ -295,18 +245,22 @@ export function startIndexer({
     if (!seeding) {
       seeding = (async () => {
         try {
-          if (startLedger > 0) {
-            await backfillFromEvents({ rpc, contractId, index, startLedger });
+          if (store.getCursor()) {
+            // Warm restart: the DB already holds everything up to `cursor`.
+            logger.log("[indexer] resuming from persisted cursor");
+          } else if (startLedger > 0) {
+            const { folded } = await backfillFromEvents({ rpc, contractId, store, startLedger });
+            logger.log(`[indexer] backfilled ${folded} event(s) from ledger ${startLedger}`);
           } else {
-            await seedFromStorage({ rpc, contractId, index });
+            const { streams } = await seedFromStorage({ rpc, contractId, store });
+            logger.log(`[indexer] seeded ${streams} stream(s) from storage scan`);
           }
-          index.seeded = true;
-          index.seedError = null;
-          logger.log(
-            `[indexer] seeded ${index.streams.size} stream(s) from ${startLedger > 0 ? `ledger ${startLedger}` : "storage scan"}`,
-          );
+          store.markSeeded();
+          store.setMeta("seedError", "");
+          store.setMeta("seededAt", new Date().toISOString());
+          logger.log(`[indexer] ready — ${store.countStreams()} stream(s) indexed`);
         } catch (err) {
-          index.seedError = err.message;
+          store.setMeta("seedError", err.message);
           logger.warn(`[indexer] seed failed: ${err.message} — retrying`);
         } finally {
           seeding = null;
@@ -317,27 +271,27 @@ export function startIndexer({
   };
 
   const poll = async () => {
-    if (!index.seeded) {
+    if (!store.isSeeded()) {
       await seed(); // keep retrying until the backfill lands
       return;
     }
     try {
-      const n = await pollForward({ rpc, contractId, index });
+      const n = await pollForward({ rpc, contractId, store, onEvent });
       if (n > 0) {
-        logger.log(`[indexer] folded ${n} new event(s) — ${index.streams.size} stream(s) tracked`);
+        logger.log(`[indexer] folded ${n} new event(s) — ${store.countStreams()} stream(s) tracked`);
       }
     } catch (err) {
       logger.warn(`[indexer] poll failed: ${err.message} — will retry`);
     }
   };
 
-  seed(); // fire-and-forget; routes 503 until seeded (see index.js)
+  seed(); // fire-and-forget; routes 503 until seeded (see app.js)
   const timer = setInterval(poll, pollMs);
-  return { index, stop: () => clearInterval(timer) };
+  return { store, stop: () => clearInterval(timer) };
 }
 
 // ---------------------------------------------------------------------------
-// Enrichment (mirrors the contract's vesting math + the old scan endpoint)
+// Enrichment (mirrors the contract's vesting math)
 // ---------------------------------------------------------------------------
 
 /**
@@ -346,8 +300,7 @@ export function startIndexer({
  * `cliff` gates the unlock without re-basing the schedule: nothing accrues
  * before `cliff`, and from `cliff` on the ordinary `start`→`end` line applies,
  * so the pre-cliff portion unlocks at once. It defaults to `start`, which is
- * exactly `create_stream`'s no-cliff behaviour (and the value stored for every
- * stream created before the schedule upgrade).
+ * exactly `create_stream`'s no-cliff behaviour.
  */
 export function vestedAmount(total, start, end, now, cliff = start) {
   if (now < cliff) return 0n;
@@ -360,12 +313,9 @@ export function vestedAmount(total, start, end, now, cliff = start) {
 }
 
 /**
- * Decorate a folded index stream with computed accrual/withdrawable/progress,
- * matching the response shape the frontend already consumes from the scan
- * endpoint. For a cancelled stream, vesting is frozen: the folded `withdrawn`
- * IS the vested-at-freeze amount, so accrued == withdrawn and withdrawable is
- * 0. (`cancel` settles eagerly, and a later `withdraw` on a settled stream
- * falls through to `NothingToWithdraw`, so there is nothing left to claim.)
+ * Decorate a stored stream with computed accrual/withdrawable/progress.
+ * For a cancelled stream vesting is frozen: `cancel` settles eagerly, so the
+ * stored `withdrawn` is the vested-at-freeze amount and nothing is withdrawable.
  */
 export function enrichStream(s, now) {
   const cliff = s.cliff_time ?? s.start_time;
@@ -374,10 +324,6 @@ export function enrichStream(s, now) {
     : vestedAmount(s.total_amount, s.start_time, s.end_time, now, cliff);
   const withdrawable = s.cancelled ? 0n : accrued - s.withdrawn;
   const duration = s.end_time - s.start_time;
-  // Progress is elapsed/duration while active, and 0 until the cliff has
-  // passed (the cliff delays the unlock; it does not shorten the term). For a
-  // cancelled stream the folded `withdrawn` is the vested-at-freeze amount, so
-  // withdrawn/total is the exact frozen progress.
   const progress = s.cancelled
     ? s.total_amount === 0n
       ? 1
@@ -385,7 +331,7 @@ export function enrichStream(s, now) {
     : duration === 0n
       ? 1
       : Number(now < cliff ? 0n : now < s.end_time ? now - s.start_time : duration) /
-          Number(duration);
+        Number(duration);
 
   return {
     id: s.id,

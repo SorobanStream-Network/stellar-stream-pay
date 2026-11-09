@@ -15,6 +15,14 @@ services:
       RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
       HORIZON_URL: ${HORIZON_URL:-https://horizon-testnet.stellar.org}
       STREAM_CONTRACT_ID: ${STREAM_CONTRACT_ID:-}
+      # The event index lives in SQLite. Keep it on the named volume below so
+      # the ledger cursor survives `docker compose up --build` / recreate —
+      # that checkpoint is what lets the indexer resume instead of re-seeding.
+      DATABASE_PATH: /data/streams.db
+      INDEX_POLL_MS: ${INDEX_POLL_MS:-5000}
+      INDEX_START_LEDGER: ${INDEX_START_LEDGER:-0}
+    volumes:
+      - backend-data:/data
     ports:
       - "4000:4000"
 
@@ -67,3 +75,8 @@ services:
       - "8080:80"
     depends_on:
       - backend
+
+volumes:
+  # Persistent home of streams.db (+ WAL). `docker volume rm` to force a
+  # full re-seed from the contract's events.
+  backend-data:

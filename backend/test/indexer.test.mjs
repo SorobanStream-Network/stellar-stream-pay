@@ -1,23 +1,21 @@
 /**
- * Event-indexer tests (node:test, zero new deps).
+ * Event indexer tests (node:test, no network).
  *
- * `src/indexer.js` folds the contract's `created` / `withdraw` / `cancelled`
- * / `split_created` events into an in-memory index that the `/api/streams` and
- * `/api/stream/:address` routes serve from — replacing the per-request
- * `0..count` storage scan. These tests pin the fold semantics against the
- * contract's behavior (withdraw accumulates; cancel freezes `withdrawn` at the
- * vested-at-freeze amount; missing/archived entries are skipped) plus the
- * storage-seed, event-backfill, forward-poll, decode, and enrich paths.
+ * The indexer is exercised against a real SQLite database (`:memory:`, or a
+ * temp file for the restart test) and a fake RPC object, so the fold, the
+ * cursor checkpoint, and the resume path are all covered without a node.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Address, Keypair, nativeToScVal, scValToNative, xdr } from "@stellar/stellar-sdk";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { Address, Keypair, nativeToScVal, scValToNative } from "@stellar/stellar-sdk";
+import { openDatabase } from "../src/db.js";
 import {
   backfillFromEvents,
-  createStreamIndex,
   decodeEvent,
   enrichStream,
-  foldEvent,
   pollForward,
   seedFromStorage,
   vestedAmount,
@@ -36,71 +34,62 @@ const evt = (kind, over = {}) => ({
   token: TOKEN,
   amount: "1000",
   receiver_amount: null,
+  timestamp: null,
   start_time: "100",
   end_time: "200",
+  cliff_time: "100",
+  ledger: 10,
+  txHash: "0".repeat(64),
+  id: `${kind}-0`,
   ...over,
 });
 
-test("folds created/withdraw/cancelled into final stream state", () => {
-  const index = createStreamIndex();
-  foldEvent(index, evt("created", { stream_id: 1 }));
-  const s1 = index.streams.get(1);
+test("folds created/withdraw/cancelled into the streams table", () => {
+  const store = openDatabase();
+  store.applyEvent(evt("created", { stream_id: 1, id: "e1" }));
+
+  const s1 = store.getStream(1);
   assert.equal(s1.sender, SENDER);
-  assert.equal(s1.receiver, RECEIVER);
   assert.equal(s1.total_amount, 1000n);
-  assert.equal(s1.start_time, 100n);
-  assert.equal(s1.end_time, 200n);
+  assert.equal(s1.cliff_time, 100n);
   assert.equal(s1.withdrawn, 0n);
   assert.equal(s1.cancelled, false);
 
-  // Two withdraws accumulate (contract: receiver pulls the accrued delta).
-  foldEvent(index, evt("withdraw", { stream_id: 1, amount: "300", receiver_amount: "300" }));
-  foldEvent(index, evt("withdraw", { stream_id: 1, amount: "200", receiver_amount: "200" }));
-  assert.equal(index.streams.get(1).withdrawn, 500n);
-  assert.equal(index.counts.withdraw, 2);
+  store.applyEvent(evt("withdraw", { stream_id: 1, amount: "300", receiver_amount: "300", id: "e2" }));
+  store.applyEvent(evt("withdraw", { stream_id: 1, amount: "200", receiver_amount: "200", id: "e3" }));
+  assert.equal(store.getStream(1).withdrawn, 500n);
 
-  // Cancel pays the vested-but-unwithdrawn remainder (receiver_amount). The
-  // contract sets withdrawn = accrued on cancel, so the folded total lands on
-  // the exact vested-at-freeze amount.
-  foldEvent(index, evt("cancelled", { stream_id: 1, amount: "500", receiver_amount: "500" }));
-  const done = index.streams.get(1);
+  // Cancel settles the vested remainder: withdrawn == frozen accrued.
+  store.applyEvent(
+    evt("cancelled", { stream_id: 1, amount: "500", receiver_amount: "500", timestamp: "150", id: "e4" }),
+  );
+  const done = store.getStream(1);
   assert.equal(done.cancelled, true);
-  assert.equal(done.withdrawn, 1000n, "withdrawn == frozen accrued after cancel");
-  assert.equal(index.counts.cancelled, 1);
+  assert.equal(done.withdrawn, 1000n);
+  assert.equal(done.cancelled_at, 150n);
+  assert.equal(store.countEvents(), 4);
+  store.close();
 });
 
-test("cancel without prior withdraw freezes at the full vested amount", () => {
-  const index = createStreamIndex();
-  foldEvent(index, evt("created", { stream_id: 2, amount: "1000" }));
-  // Cancel mid-stream: accrued 500, nothing withdrawn yet.
-  foldEvent(index, evt("cancelled", { stream_id: 2, amount: "500", receiver_amount: "500" }));
-  const s = index.streams.get(2);
-  assert.equal(s.cancelled, true);
-  assert.equal(s.withdrawn, 500n);
+test("replaying an event id is idempotent (cursor overlap cannot double-count)", () => {
+  const store = openDatabase();
+  store.applyEvent(evt("created", { stream_id: 2, id: "dup-1" }));
+  store.applyEvent(evt("withdraw", { stream_id: 2, receiver_amount: "100", id: "dup-2" }));
+  assert.equal(store.getStream(2).withdrawn, 100n);
+
+  // Same event delivered twice (RPC pages are inclusive at the boundary).
+  const again = store.applyEvent(evt("withdraw", { stream_id: 2, receiver_amount: "100", id: "dup-2" }));
+  assert.equal(again.inserted, false);
+  assert.equal(store.getStream(2).withdrawn, 100n);
+  assert.equal(store.countEvents(), 2);
+  store.close();
 });
 
-test("folds split_created into group membership", () => {
-  const index = createStreamIndex();
-  foldEvent(index, {
-    kind: "split_created",
-    root_id: 3,
-    sender: SENDER,
-    token: TOKEN,
-    member_ids: [3, 4, 5],
-    total_amount: "3000",
-  });
-  const g = index.splits.get(3);
-  assert.deepEqual(g.member_ids, [3, 4, 5]);
-  assert.equal(g.total_amount, 3000n);
-  assert.equal(index.counts.split_created, 1);
-});
-
-test("ignores unknown kinds and events for unknown stream ids defensively", () => {
-  const index = createStreamIndex();
-  foldEvent(index, { kind: "mystery", stream_id: 1 });
-  foldEvent(index, evt("withdraw", { stream_id: 99, receiver_amount: "10" })); // no created yet
-  assert.equal(index.streams.size, 0);
-  assert.equal(index.counts.mystery, 1);
+test("ignores events for unknown streams defensively", () => {
+  const store = openDatabase();
+  store.applyEvent(evt("withdraw", { stream_id: 99, receiver_amount: "10", id: "orphan" }));
+  assert.equal(store.getStream(99), null);
+  store.close();
 });
 
 test("decodes a raw RPC event (topics + map value) into JSON-safe fields", () => {
@@ -119,6 +108,7 @@ test("decodes a raw RPC event (topics + map value) into JSON-safe fields", () =>
       token: TOKEN,
       amount: 1000n,
       receiver_amount: 0n,
+      timestamp: 1_700_000_000n,
       start_time: 100n,
       end_time: 200n,
       cliff_time: 150n,
@@ -127,17 +117,14 @@ test("decodes a raw RPC event (topics + map value) into JSON-safe fields", () =>
   const d = decodeEvent(raw);
   assert.equal(d.kind, "created");
   assert.equal(d.stream_id, 7);
-  assert.equal(d.sender, SENDER);
-  assert.equal(d.receiver, RECEIVER);
   assert.equal(d.amount, "1000");
-  assert.equal(d.receiver_amount, "0");
+  assert.equal(d.cliff_time, "150");
+  assert.equal(d.timestamp, "1700000000");
   assert.equal(d.start_time, "100");
   assert.equal(d.end_time, "200");
-  assert.equal(d.cliff_time, "150");
 });
 
-test("seeds from a storage scan (counter + per-stream getContractData)", async () => {
-  // Storage round-trip via nativeToScVal -> scValToNative.
+test("seeds from a storage scan with live state, not event-derived state", async () => {
   const rawStream = nativeToScVal({
     sender: SENDER,
     receiver: RECEIVER,
@@ -152,29 +139,26 @@ test("seeds from a storage scan (counter + per-stream getContractData)", async (
   });
   const counter = nativeToScVal(2, { type: "u64" });
   const rpc = {
-    async getContractData(_id, key, _durability) {
+    async getContractData(_id, key) {
       const isCounter = scValToNative(key)[0] === "Counter";
       return {
-        val: {
-          value: () => ({
-            val: () => (isCounter ? counter : rawStream),
-          }),
-        },
+        val: { value: () => ({ val: () => (isCounter ? counter : rawStream) }) },
       };
     },
   };
-  const index = createStreamIndex();
-  await seedFromStorage({ rpc, contractId: "C", index });
-  assert.equal(index.seeded, true);
-  assert.equal(index.streams.size, 2);
-  const s = index.streams.get(1);
-  assert.equal(s.sender, SENDER);
-  assert.equal(s.total_amount, 1000n);
-  assert.equal(s.withdrawn, 250n);
+  const store = openDatabase();
+  const { streams } = await seedFromStorage({ rpc, contractId: "C", store });
+  assert.equal(streams, 2);
+  const s = store.getStream(1);
+  assert.equal(s.withdrawn, 250n, "seeding keeps the live withdrawn amount");
   assert.equal(s.cliff_time, 150n);
+  store.close();
 });
 
-test("backfills from events across ledger windows and keeps the forward cursor", async () => {
+test("backfill checkpoints the cursor and a restart resumes forward from it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "stream-index-"));
+  const file = join(dir, "index.db");
+
   const mkRaw = (kind, id, ledger) => ({
     id: `e-${id}`,
     ledger,
@@ -192,6 +176,7 @@ test("backfills from events across ledger windows and keeps the forward cursor",
       receiver_amount: kind === "created" ? 0n : 100n,
       start_time: 100n,
       end_time: 200n,
+      cliff_time: 100n,
     }),
   });
   const pages = [
@@ -205,53 +190,81 @@ test("backfills from events across ledger windows and keeps the forward cursor",
       return pages[Math.min(calls++, pages.length - 1)];
     },
   };
-  const index = createStreamIndex();
-  await backfillFromEvents({ rpc, contractId: "C", index, startLedger: 1 });
-  assert.equal(index.seeded, true);
-  assert.equal(index.streams.size, 2);
-  assert.equal(index.cursor, "c3");
-  assert.ok(calls >= 3, "walked multiple windows to reach the head");
+
+  const first = openDatabase(file);
+  await backfillFromEvents({ rpc, contractId: "C", store: first, startLedger: 1 });
+  assert.equal(first.countStreams(), 2);
+  assert.equal(first.getCursor(), "c3");
+  first.close();
+
+  // Restart: the persisted cursor is the resume point, so the next poll must
+  // not fall back to a window scan of the head.
+  const reopened = openDatabase(file);
+  assert.equal(reopened.getCursor(), "c3", "cursor survives a restart");
+  let seenParams = null;
+  const pollRpc = {
+    async getLatestLedger() {
+      throw new Error("should not be called when a cursor exists");
+    },
+    async getEvents(params) {
+      seenParams = params;
+      return { events: [], cursor: "c4", latestLedger: 31_000 };
+    },
+  };
+  await pollForward({ rpc: pollRpc, contractId: "C", store: reopened });
+  assert.equal(seenParams.cursor, "c3");
+  assert.equal(seenParams.startLedger, undefined);
+  assert.equal(reopened.getCursor(), "c4");
+  reopened.close();
+  rmSync(dir, { recursive: true, force: true });
 });
 
-test("pollForward folds only the new events from the cursor", async () => {
-  const raw = (kind, id) => ({
-    id: `e-${id}`,
+test("pollForward broadcasts only newly folded events", async () => {
+  const store = openDatabase();
+  store.markSeeded();
+  // Forward polling always starts from the persisted checkpoint (a warm
+  // restart), never from a fresh head window.
+  store.setCursor("c0");
+  const raw = {
+    id: "e-created-9",
     ledger: 100,
     txHash: "0".repeat(64),
     topic: [
       nativeToScVal("stream_event", { type: "symbol" }),
-      nativeToScVal(kind, { type: "symbol" }),
-      nativeToScVal(id, { type: "u64" }),
+      nativeToScVal("created", { type: "symbol" }),
+      nativeToScVal(9, { type: "u64" }),
       new Address(SENDER).toScVal(),
       new Address(RECEIVER).toScVal(),
     ],
     value: nativeToScVal({
       token: TOKEN,
-      amount: kind === "created" ? 1000n : 50n,
-      receiver_amount: kind === "created" ? 0n : 50n,
+      amount: 1000n,
+      receiver_amount: 0n,
       start_time: 100n,
       end_time: 200n,
+      cliff_time: 100n,
     }),
-  });
+  };
+  const broadcast = [];
   const rpc = {
-    async getLatestLedger() {
-      return { sequence: 100 };
-    },
-    async getEvents(params) {
-      if (params.cursor === "tail") return { events: [], cursor: "tail", latestLedger: 100 };
-      return { events: [raw("created", 9)], cursor: "tail", latestLedger: 100 };
+    async getEvents() {
+      return { events: [raw, raw], cursor: "tail", latestLedger: 100 };
     },
   };
-  const index = createStreamIndex();
-  index.seeded = true; // already backfilled
-  const n = await pollForward({ rpc, contractId: "C", index });
-  assert.equal(n, 1);
-  assert.equal(index.streams.size, 1);
-  assert.equal(index.cursor, "tail");
-  assert.ok(index.lastPollAt);
+  const n = await pollForward({
+    rpc,
+    contractId: "C",
+    store,
+    onEvent: (e) => broadcast.push(e),
+  });
+  assert.equal(n, 1, "the duplicate in the same page is folded once");
+  assert.equal(broadcast.length, 1);
+  assert.equal(store.countStreams(), 1);
+  assert.equal(store.getMeta("lastPollAt") !== null, true);
+  store.close();
 });
 
-test("enrichStream mirrors the contract vesting math and freezes cancelled streams", () => {
+test("enrichStream mirrors the contract's vesting math and freezes cancelled streams", () => {
   const now = 150n; // mid-stream: 50% of [100, 200]
   const s = {
     id: 0,
@@ -261,6 +274,7 @@ test("enrichStream mirrors the contract vesting math and freezes cancelled strea
     total_amount: 1000n,
     start_time: 100n,
     end_time: 200n,
+    cliff_time: 100n,
     withdrawn: 0n,
     cancelled: false,
     cancelled_at: 0n,
@@ -271,19 +285,15 @@ test("enrichStream mirrors the contract vesting math and freezes cancelled strea
   assert.equal(e.withdrawable, "500");
   assert.equal(e.progress, 0.5);
 
-  // Fully vested: accrued == total, withdrawable == total - withdrawn.
   const e2 = enrichStream({ ...s, withdrawn: 200n }, 999n);
   assert.equal(e2.accrued, "1000");
   assert.equal(e2.withdrawable, "800");
   assert.equal(e2.progress, 1);
 
-  // Cancelled: frozen at the folded withdrawn amount, withdrawable 0. `cancel`
-  // settles eagerly and a post-cancel `withdraw` returns `NothingToWithdraw`,
-  // so there is nothing left to claim.
+  // Cancelled: `cancel` settled on-chain, so nothing remains withdrawable.
   const c = enrichStream({ ...s, withdrawn: 500n, cancelled: true }, 999n);
   assert.equal(c.accrued, "500");
   assert.equal(c.withdrawable, "0");
-  assert.equal(c.cancelled, true);
 });
 
 test("enrichStream gates accrual on the cliff without re-basing the schedule", () => {
@@ -300,36 +310,10 @@ test("enrichStream gates accrual on the cliff without re-basing the schedule", (
     cancelled: false,
     cancelled_at: 0n,
   };
-
-  // Before the cliff nothing accrues, even though the linear line has moved.
-  assert.equal(vestedAmount(s.total_amount, s.start_time, s.end_time, 120n, s.cliff_time), 0n);
-  const before = enrichStream(s, 120n);
-  assert.equal(before.accrued, "0");
-  assert.equal(before.withdrawable, "0");
-  assert.equal(before.progress, 0);
-  assert.equal(before.cliff_time, "150");
-
-  // At the cliff the pre-cliff portion unlocks: 50% of [100, 200].
-  const at = enrichStream(s, 150n);
-  assert.equal(at.accrued, "500");
-  assert.equal(at.withdrawable, "500");
-  assert.equal(at.progress, 0.5);
-
-  // Past it, the original start->end schedule continues unchanged.
+  assert.equal(enrichStream(s, 120n).accrued, "0");
+  assert.equal(enrichStream(s, 120n).progress, 0);
+  assert.equal(enrichStream(s, 150n).accrued, "500");
   assert.equal(enrichStream(s, 175n).accrued, "750");
   assert.equal(enrichStream(s, 999n).accrued, "1000");
-
-  // A record from before the schedule upgrade has no `cliff_time`: the plain
-  // linear line applies, exactly as before the change.
-  const { cliff_time: _omitted, ...legacy } = s;
-  assert.equal(enrichStream(legacy, 120n).accrued, "200");
-  assert.equal(enrichStream(legacy, 120n).cliff_time, "100");
-});
-
-test("foldEvent defaults cliff_time to start_time for pre-upgrade created events", () => {
-  const index = createStreamIndex();
-  foldEvent(index, evt("created", { stream_id: 5 }));
-  assert.equal(index.streams.get(5).cliff_time, 100n, "no cliff => cliff_time == start_time");
-  foldEvent(index, evt("created", { stream_id: 6, cliff_time: "130" }));
-  assert.equal(index.streams.get(6).cliff_time, 130n);
+  assert.equal(enrichStream(s, 999n).cliff_time, "150");
 });

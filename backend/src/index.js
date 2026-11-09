@@ -1,186 +1,128 @@
+/**
+ * StellarStream-Pay backend — SQLite-backed event indexer + JSON API.
+ *
+ * Startup sequence:
+ *   1. open (or create) the index database at `DATABASE_PATH`,
+ *   2. create the SSE hub,
+ *   3. start the event indexer — it resumes from the persisted cursor, or
+ *      backfills storage / events on a cold start (see `indexer.js`),
+ *   4. serve the API from the database.
+ *
+ * Routes return 503 until the first backfill lands, so a client never sees a
+ * half-built index as "no streams".
+ */
 import "dotenv/config";
-import express from "express";
-import cors from "cors";
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { Horizon } from "@stellar/stellar-sdk";
 import { Server } from "@stellar/stellar-sdk/rpc";
-import {
-  enrichStream,
-  queryContractEvents,
-  startIndexer,
-} from "./indexer.js";
+import { createApp } from "./app.js";
+import { openDatabase } from "./db.js";
+import { startIndexer } from "./indexer.js";
+import { createEventHub } from "./sse.js";
 
-// ---------------------------------------------------------------------------
-// Configuration (env-driven; see .env.example)
-// ---------------------------------------------------------------------------
-const {
-  PORT = 4000,
-  RPC_URL = "https://soroban-testnet.stellar.org",
-  HORIZON_URL = "https://horizon-testnet.stellar.org",
-  STREAM_CONTRACT_ID = "",
-  // Event indexer tuning (see src/indexer.js):
-  //   INDEX_POLL_MS       — forward-poll cadence (default 15s).
-  //   INDEX_START_LEDGER  — >0: pure event backfill from this ledger; unset/0:
-  //                         seed once from a storage scan, then events forward.
-  INDEX_POLL_MS = 15_000,
-  INDEX_START_LEDGER = 0,
-} = process.env;
+/**
+ * Wire the process together. Exported (rather than run inline) so tests can
+ * build the same object graph with a fake RPC and an in-memory database.
+ */
+export function startServer({
+  env = process.env,
+  rpc: injectedRpc,
+  store: injectedStore,
+  port = undefined,
+  logger = console,
+} = {}) {
+  const {
+    PORT = 4000,
+    RPC_URL = "https://soroban-testnet.stellar.org",
+    HORIZON_URL = "https://horizon-testnet.stellar.org",
+    NETWORK_PASSPHRASE = "Test SDF Network ; September 2015",
+    STREAM_CONTRACT_ID = "",
+    DATABASE_PATH = "./data/streams.db",
+    INDEX_POLL_MS = 15_000,
+    INDEX_START_LEDGER = 0,
+    RATE_LIMIT_WINDOW_MS = 60_000,
+    RATE_LIMIT_MAX = 240,
+  } = env;
 
-const rpc = new Server(RPC_URL, {
-  // Only allow plain-http for local RPC (e.g. localnet); always https in prod.
-  allowHttp: RPC_URL.startsWith("http://"),
-});
+  if (!STREAM_CONTRACT_ID) {
+    logger.warn(
+      "[warn] STREAM_CONTRACT_ID is not set. Stream endpoints will return 400 until it is configured.",
+    );
+  }
 
-const horizon = new Horizon.Server(HORIZON_URL);
+  // SQLite needs its directory to exist; the container mounts `/data`.
+  if (!injectedStore && DATABASE_PATH !== ":memory:") {
+    mkdirSync(dirname(resolve(DATABASE_PATH)), { recursive: true });
+  }
 
-if (!STREAM_CONTRACT_ID) {
-  console.warn(
-    "[warn] STREAM_CONTRACT_ID is not set. Stream endpoints will return 400 until it is configured.",
-  );
+  const rpc =
+    injectedRpc ?? new Server(RPC_URL, { allowHttp: RPC_URL.startsWith("http://") });
+  const store = injectedStore ?? openDatabase(DATABASE_PATH);
+  const hub = createEventHub();
+
+  const indexer = STREAM_CONTRACT_ID
+    ? startIndexer({
+        rpc,
+        contractId: STREAM_CONTRACT_ID,
+        store,
+        startLedger: Number(INDEX_START_LEDGER) || 0,
+        pollMs: Number(INDEX_POLL_MS) || 15_000,
+        logger,
+        // Every newly folded event goes out to connected dashboards.
+        onEvent: (event) => hub.broadcast(event),
+      })
+    : null;
+
+  const app = createApp({
+    store,
+    hub,
+    contractId: STREAM_CONTRACT_ID,
+    network: NETWORK_PASSPHRASE,
+    rpc,
+    horizon: HORIZON_URL ? new Horizon.Server(HORIZON_URL) : null,
+    rateLimitOptions: {
+      windowMs: Number(RATE_LIMIT_WINDOW_MS) || 60_000,
+      limit: Number(RATE_LIMIT_MAX) || 240,
+    },
+  });
+
+  // `??` and `||` cannot be mixed without parentheses (that is a SyntaxError,
+  // not a precedence quirk), so the listen port is resolved in one place.
+  const listenPort = port ?? (Number(PORT) || undefined);
+  const server = app.listen(listenPort, () => {
+    const address = server.address();
+    const shown =
+      typeof address === "object" && address?.port ? address.port : listenPort ?? PORT;
+    logger.log(`StellarStream-Pay backend listening on http://localhost:${shown}`);
+    logger.log(`  RPC:      ${RPC_URL}`);
+    logger.log(`  Horizon:  ${HORIZON_URL}`);
+    logger.log(`  Database: ${injectedStore ? ":memory:" : DATABASE_PATH}`);
+  });
+
+  /**
+   * Stop the indexer, SSE hub, HTTP server, and database. Returns a promise so
+   * tests can await a clean teardown; the signal handler is what exits.
+   */
+  const shutdown = () =>
+    new Promise((resolve) => {
+      indexer?.stop();
+      hub.close();
+      server.close(() => {
+        store.close();
+        resolve();
+      });
+    });
+
+  const onSignal = () => {
+    void shutdown().then(() => process.exit(0));
+  };
+  process.once("SIGTERM", onSignal);
+  process.once("SIGINT", onSignal);
+
+  return { app, server, store, hub, indexer, shutdown };
 }
 
-// ---------------------------------------------------------------------------
-// Event index — the in-memory source of truth for stream state.
-// ---------------------------------------------------------------------------
-// The indexer seeds once (storage scan by default, or event backfill from
-// INDEX_START_LEDGER) and then polls `getEvents` forward, folding
-// created/withdraw/cancelled/split_created events into an in-memory Map. The
-// stream routes below read from it instead of scanning storage ids `0..count`
-// on every request. Routes return 503 until the seed completes (fresh
-// deploys with no streams seed instantly).
-const { index, stop: stopIndexer } = startIndexer({
-  rpc,
-  contractId: STREAM_CONTRACT_ID,
-  startLedger: Number(INDEX_START_LEDGER) || 0,
-  pollMs: Number(INDEX_POLL_MS) || 15_000,
-});
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// ---------------------------------------------------------------------------
-// Routes
-// ---------------------------------------------------------------------------
-
-app.get("/health", async (_req, res) => {
-  try {
-    const network = await rpc.getNetwork();
-    res.json({
-      status: "ok",
-      network: network.passphrase,
-      protocolVersion: network.protocolVersion,
-      streamContractId: STREAM_CONTRACT_ID || null,
-      indexSeeded: index.seeded,
-      indexedStreams: index.streams.size,
-    });
-  } catch (err) {
-    res.status(500).json({ status: "error", message: err.message });
-  }
-});
-
-/** 503 helper while the index backfill is still running. */
-function requireIndex(res) {
-  if (!STREAM_CONTRACT_ID) {
-    res.status(400).json({ error: "STREAM_CONTRACT_ID is not configured on the server." });
-    return false;
-  }
-  if (!index.seeded) {
-    res.status(503).json({
-      error: "Stream index is still seeding — retry in a few seconds.",
-      reason: index.seedError ?? null,
-    });
-    return false;
-  }
-  return true;
-}
-
-// All indexed streams (event-folded state, enriched with vesting math).
-app.get("/api/streams", async (_req, res) => {
-  if (!requireIndex(res)) return;
-  const now = BigInt(Math.floor(Date.now() / 1000));
-  const streams = [...index.streams.values()]
-    .sort((a, b) => a.id - b.id)
-    .map((s) => enrichStream(s, now));
-  res.json({ network: RPC_URL, count: streams.length, streams });
-});
-
-// Streams involving `address`, either as sender or receiver — served from the
-// event index, not a per-request storage scan.
-app.get("/api/stream/:address", async (req, res) => {
-  if (!requireIndex(res)) return;
-  const { address } = req.params;
-  const now = BigInt(Math.floor(Date.now() / 1000));
-  const streams = [...index.streams.values()]
-    .filter((s) => s.sender === address || s.receiver === address)
-    .sort((a, b) => a.id - b.id)
-    .map((s) => enrichStream(s, now));
-  res.json({ address, network: RPC_URL, count: streams.length, streams });
-});
-
-// Horizon balance lookup (classic accounts + SAC trustlines).
-app.get("/api/account/:address", async (req, res) => {
-  const { address } = req.params;
-  try {
-    const account = await horizon.loadAccount(address);
-    res.json({
-      id: account.accountId(),
-      balances: account.balances.map((b) => ({
-        asset: b.asset_type === "native" ? "XLM" : `${b.asset_code}:${b.asset_issuer}`,
-        balance: b.balance,
-      })),
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Raw lifecycle events (`created` / `withdraw` / `cancelled` + splits) for
-// the contract. Page with `?cursor=<n>` (from a previous response) or query a
-// ledger range with `?startLedger=<n>`.
-app.get("/api/events", async (req, res) => {
-  if (!STREAM_CONTRACT_ID) {
-    return res.status(400).json({ error: "STREAM_CONTRACT_ID is not configured on the server." });
-  }
-  const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
-  const startLedger = req.query.startLedger === undefined
-    ? undefined
-    : Number(req.query.startLedger);
-  const limit = Number(req.query.limit ?? 100);
-  if (cursor && startLedger !== undefined) {
-    return res.status(400).json({ error: "Use either `cursor` or `startLedger`, not both." });
-  }
-  // Soroban RPC requires startLedger >= 1 (ledgers are 1-indexed).
-  if (startLedger !== undefined && (!Number.isInteger(startLedger) || startLedger < 1)) {
-    return res.status(400).json({ error: "startLedger must be a positive integer" });
-  }
-  try {
-    const { events, cursor: nextCursor, latestLedger } = await queryContractEvents({
-      rpc,
-      contractId: STREAM_CONTRACT_ID,
-      startLedger,
-      cursor,
-      limit,
-    });
-    res.json({
-      contract: STREAM_CONTRACT_ID,
-      count: events.length,
-      cursor: nextCursor,
-      latestLedger,
-      events,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Graceful shutdown for the poller (SIGTERM in containers).
-process.on("SIGTERM", () => {
-  stopIndexer();
-  process.exit(0);
-});
-
-app.listen(PORT, () => {
-  console.log(`StellarStream-Pay backend listening on http://localhost:${PORT}`);
-  console.log(`  RPC:     ${RPC_URL}`);
-  console.log(`  Horizon: ${HORIZON_URL}`);
-});
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) startServer();
