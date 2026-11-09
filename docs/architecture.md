@@ -16,10 +16,10 @@ contract is self-custodial and the settlement logic is on-chain.
 
 ```mermaid
 flowchart LR
-    Payer["Employer / Payer<br/>(Freighter wallet)"] -->|create_stream, cancel| CORE["stream-core<br/>(Soroban vault)"]
-    Payee["Receiver / Payee<br/>(Freighter wallet)"] -->|withdraw, cancel| CORE
+    Payer["Employer / Payer<br/>(Stellar wallet)"] -->|create_stream, cancel| CORE["stream-core<br/>(Soroban vault)"]
+    Payee["Receiver / Payee<br/>(Stellar wallet)"] -->|withdraw, cancel| CORE
 
-    DApp["Dashboard<br/>(React + Freighter)"] -->|read/write| RPC["Soroban RPC"]
+    DApp["Dashboard<br/>(React + Stellar Wallets Kit)"] -->|read/write| RPC["Soroban RPC"]
     DApp -->|HTTP| API["Indexer / API<br/>(Express)"]
 
     API -->|getContractData, getEvents| RPC
@@ -54,13 +54,15 @@ The system is split into three deployable containers plus the on-chain contract.
 flowchart LR
     subgraph repo["Repository (monorepo)"]
         CORE["contracts/core<br/>stream-core v1<br/>(Rust, no_std)"]
-        API["backend<br/>Express indexer<br/>(Node 20, ESM)"]
-        DAPP["frontend<br/>React + Vite<br/>(Freighter)"]
+        API["backend<br/>Express + SQLite index<br/>(Node 22, ESM)"]
+        DB[("SQLite<br/>streams.db")]
+        DAPP["frontend<br/>React + Vite<br/>(Stellar Wallets Kit)"]
     end
 
     CORE -->|deploys to| CHAIN["Soroban (Testnet/Mainnet)"]
-    DAPP -->|Freighter signs| CHAIN
+    DAPP -->|wallet signs| CHAIN
     DAPP -->|HTTP :4000| API
+    API -->|event fold, cursor| DB
     API -->|Soroban RPC| CHAIN
     API -->|Horizon| HORIZON["Horizon"]
 ```
@@ -68,8 +70,13 @@ flowchart LR
 | Container | Responsibility | Technology |
 |-----------|---------------|------------|
 | `stream-core` | Locks funds, enforces linear vesting, settles withdrawals and cancellations, emits lifecycle events | Rust, `soroban-sdk` 27, `#![no_std]` |
-| `backend` | Reads contract storage and events, decorates stream state (`accrued`, `withdrawable`, `progress`), serves a JSON API | Node 20, Express, `@stellar/stellar-sdk` |
-| `frontend` | Wallet connection, stream dashboard, and transaction assembly/signing | React 18, Vite, `@stellar/freighter-api` |
+| `backend` | Indexes the contract's lifecycle events into SQLite (ledger-cursor checkpoint, backfill + resume), decorates stream state (`accrued`, `withdrawable`, `progress`), serves a validated JSON API plus SSE | Node 22, Express, `better-sqlite3`, `zod`, `@stellar/stellar-sdk` |
+| `frontend` | Wallet connection (Stellar Wallets Kit), stream dashboard with token metadata and live accrual, and transaction assembly/signing | React 18, Vite, `@creit.tech/stellar-wallets-kit` |
+
+The index is a **cache, not a source of truth**: it can always be rebuilt by
+re-seeding from storage or replaying the contract's events from
+`INDEX_START_LEDGER`. `DATABASE_PATH` therefore has to live on a persistent
+volume — without it, every restart re-backfills from the first event.
 
 ---
 
@@ -110,8 +117,13 @@ track streams without polling storage:
 - Data: `{ token, amount, receiver_amount, timestamp, start_time, cliff_time,
   end_time }` (map format)
 
-The backend's `/api/events` endpoint queries these via Soroban RPC `getEvents`
-with topic filters.
+The backend consumes exactly these events: `backend/src/indexer.js` pages
+through `getEvents` (topic-filtered), folds each event into SQLite in one
+transaction, and checkpoints the page cursor — so `/api/events` reads from the
+database instead of RPC, `/api/stream/:address` is a keyset-paginated query over
+folded state, and `/api/events/stream` pushes new events to browsers over SSE.
+Without that checkpoint, Soroban RPC's limited event-retention window would
+silently lose history on a restart.
 
 ### 3.3 The settlement invariant
 
@@ -150,7 +162,7 @@ floor division.
 
 ```mermaid
 sequenceDiagram
-    participant S as Sender (Freighter)
+    participant S as Sender (Stellar wallet)
     participant C as stream-core
     participant T as Token (SAC/SEP-41)
 

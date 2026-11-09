@@ -13,8 +13,8 @@ Please also read the [Code of Conduct](CODE_OF_CONDUCT.md) and
 ```text
 contracts/            Cargo workspace
 └── core/             frozen stream-core primitive (stream-core v1)
-backend/              Express indexer / API (Node 20+, ESM)
-frontend/             React + Vite DApp (Freighter wallet)
+backend/              Express + SQLite event indexer / API (Node 22+, ESM)
+frontend/             React + Vite DApp (Stellar Wallets Kit)
 docs/                 architecture & design docs
 .github/workflows/    CI (contract, backend, frontend, PR title lint)
 ```
@@ -31,8 +31,8 @@ Each workspace has its own toolchain requirements:
 | Workspace | Tool | Command |
 |-----------|------|---------|
 | `contracts/core` | Rust 1.84+ / `stellar-cli` | `cargo test -p stream-core`, `stellar contract build` |
-| `backend` | Node 20+ | `npm install`, `npm start` |
-| `frontend` | Node 20+ | `npm install`, `npm run build` |
+| `backend` | Node 22+ | `npm install`, `npm test`, `npm start` |
+| `frontend` | Node 22+ | `npm install`, `npm test`, `npm run build` |
 
 ## Development workflow
 
@@ -52,10 +52,10 @@ Each workspace has its own toolchain requirements:
    cd contracts/core && cargo test -p stream-core && stellar contract build
 
    # backend
-   cd backend && npm install && node --check src/index.js
+   cd backend && npm install && npm test
 
    # frontend
-   cd frontend && npm install && npm run build
+   cd frontend && npm install && npm test && npm run build
    ```
 
 4. **Open a pull request** with a descriptive title following
@@ -96,7 +96,8 @@ When changing the contract, keep the safety properties intact:
 - **Backend**: keep the storage-key encoding and event-decoding helpers in sync
   with the contract; the `data_key_encoding_matches_backend_expectations` test
   pins the XDR contract between the two.
-- **Frontend**: ensure `npm run build` (tsc + Vite) stays green.
+- **Frontend**: keep `npm test` (Vitest — accrual and formatting helpers) and
+  `npm run build` (tsc + Vite) green.
 
 ## Reporting issues
 
