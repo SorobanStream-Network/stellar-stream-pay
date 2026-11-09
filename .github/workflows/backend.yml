@@ -12,7 +12,7 @@ on:
 
 jobs:
   backend:
-    name: Backend — install & syntax check
+    name: Backend — install, syntax check & tests
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -25,7 +25,10 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Matches backend/Dockerfile (node:22-bookworm-slim) and the
+          # `engines` floor, so the better-sqlite3 native module is built for
+          # the runtime it actually ships on.
+          node-version: 22
           cache: npm
           cache-dependency-path: backend/package-lock.json
 
@@ -34,3 +37,8 @@ jobs:
 
       - name: Syntax check
         run: node --check src/index.js
+
+      # node:test only — the suite mocks Soroban RPC and uses temp/in-memory
+      # SQLite, so it needs no services or network access.
+      - name: Test
+        run: npm test
