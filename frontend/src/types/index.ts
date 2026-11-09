@@ -51,6 +51,12 @@ export type CreateStreamParams = {
    */
   startDelaySeconds?: number;
   /**
+   * Optional absolute start (unix seconds), e.g. from a date picker. Takes
+   * precedence over `startDelaySeconds`. Must not be in the past (the contract
+   * tolerates a couple of minutes of clock skew).
+   */
+  startTime?: number;
+  /**
    * Optional cliff in seconds after the start. Nothing is withdrawable before
    * `start_time + cliffSeconds`; the schedule still runs from `start_time`, so
    * the pre-cliff portion unlocks at once. Must not exceed the duration.

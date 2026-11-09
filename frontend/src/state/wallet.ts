@@ -1,11 +1,11 @@
 import { create } from "zustand";
-import { connectWallet } from "../lib/stellar/wallet";
+import { connectWallet, disconnectWallet } from "../lib/stellar/wallet";
 import { useUiStore } from "./ui";
 
 /**
- * Wallet session state: the connected Freighter address and connection
- * progress. Client-only — nothing here is server cache, so it belongs in
- * Zustand rather than TanStack Query.
+ * Wallet session state: the connected address (whichever wallet the user picked
+ * in Stellar Wallets Kit) and connection progress. Client-only — nothing here
+ * is server cache, so it belongs in Zustand rather than TanStack Query.
  */
 interface WalletState {
   address: string | null;
@@ -30,5 +30,8 @@ export const useWalletStore = create<WalletState>((set) => ({
       set({ connecting: false });
     }
   },
-  disconnect: () => set({ address: null }),
+  disconnect: () => {
+    void disconnectWallet();
+    set({ address: null });
+  },
 }));

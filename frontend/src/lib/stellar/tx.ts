@@ -1,9 +1,9 @@
 import { TransactionBuilder } from "@stellar/stellar-sdk";
 import type { Transaction } from "@stellar/stellar-sdk";
 import type { Server } from "@stellar/stellar-sdk/rpc";
-import { signTransaction } from "@stellar/freighter-api";
 import { CONFIG } from "../../config";
 import { decodeSorobanError, decodeTransactionStatus, WalletError } from "./errors";
+import { signWalletTransaction } from "./wallet";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -26,30 +26,25 @@ export async function prepareTransaction(
 }
 
 /**
- * Sign an already-prepared transaction with Freighter, submit it to the RPC,
- * and poll until it reaches a terminal state. Returns the tx hash.
+ * Sign an already-prepared transaction with the connected wallet, submit it to
+ * the RPC, and poll until it reaches a terminal state. Returns the tx hash.
  *
- * Every failure point — Freighter rejection, network rejection, on-chain
- * failure — is decoded into a friendly message before being thrown.
+ * `signer` pins the address that must sign, so a wallet switched mid-flow
+ * fails loudly instead of signing for the wrong account. Every failure point —
+ * wallet rejection, network rejection, on-chain failure — is decoded into a
+ * friendly message before being thrown.
  */
 export async function signAndSubmit(
   server: Server,
   tx: Transaction,
+  signer?: string,
 ): Promise<string> {
   const prepared = await prepareTransaction(server, tx);
 
-  const signed = (await signTransaction(prepared.toXDR(), {
-    networkPassphrase: CONFIG.networkPassphrase,
-  })) as { signedTxXdr?: string; error?: unknown };
-
-  if (signed.error || !signed.signedTxXdr) {
-    throw new WalletError(
-      decodeSorobanError(signed.error) || "Freighter refused to sign.",
-    );
-  }
+  const signedXdr = await signWalletTransaction(prepared.toXDR(), signer);
 
   const signedTx = TransactionBuilder.fromXDR(
-    signed.signedTxXdr,
+    signedXdr,
     CONFIG.networkPassphrase,
   ) as Transaction;
 

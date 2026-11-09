@@ -148,11 +148,14 @@ export async function createStream(params: CreateStreamParams): Promise<string> 
     amount,
     durationSeconds,
     startDelaySeconds,
+    startTime,
     cliffSeconds,
   } = params;
   const delay =
     startDelaySeconds != null && startDelaySeconds > 0 ? startDelaySeconds : undefined;
-  const scheduled = delay != null || cliffSeconds != null;
+  // An absolute `startTime` (from a date picker) wins over the relative delay.
+  const absoluteStart = startTime != null && startTime > 0 ? Math.trunc(startTime) : undefined;
+  const scheduled = absoluteStart != null || delay != null || cliffSeconds != null;
 
   const buildArgs = (startTime: number | undefined): xdr.ScVal[] => {
     const args: xdr.ScVal[] = [
@@ -170,8 +173,9 @@ export async function createStream(params: CreateStreamParams): Promise<string> 
     sender,
     scheduled ? "create_stream_scheduled" : "create_stream",
     scheduled
-      ? // Thunk: anchor `start_time` at build time, not at call time.
-        () => buildArgs(delay != null ? resolveStartTime(delay) : undefined)
+      ? // Thunk: with a relative delay, anchor `start_time` at build time rather
+        // than at call time; an absolute pick is used as given.
+        () => buildArgs(absoluteStart ?? (delay != null ? resolveStartTime(delay) : undefined))
       : buildArgs(undefined),
     () => preflightCreateStream(params),
   );

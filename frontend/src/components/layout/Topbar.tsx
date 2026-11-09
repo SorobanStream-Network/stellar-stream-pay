@@ -35,7 +35,7 @@ export function Topbar({
         </div>
       ) : (
         <Button onClick={onConnect} disabled={connecting}>
-          {connecting ? "Connecting…" : "Connect Freighter"}
+          {connecting ? "Connecting…" : "Connect wallet"}
         </Button>
       )}
     </header>

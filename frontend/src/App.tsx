@@ -1,13 +1,16 @@
+import { useQuery } from "@tanstack/react-query";
 import { useCancel } from "./hooks/mutations/useCancel";
 import { useCreateStream } from "./hooks/mutations/useCreateStream";
 import { useWithdraw } from "./hooks/mutations/useWithdraw";
+import { useNow } from "./hooks/useNow";
 import { useStreams } from "./hooks/queries/useStreams";
+import { checkNetwork } from "./lib/stellar/network";
 import { useUiStore } from "./state/ui";
 import { useWalletStore } from "./state/wallet";
 import { Topbar } from "./components/layout/Topbar";
 import {
   CreateStreamForm,
-  type CreateStreamFormValues,
+  type CreateStreamDraft,
 } from "./components/streams/CreateStreamForm";
 import { StreamList } from "./components/streams/StreamList";
 import { Banner } from "./components/ui/Banner";
@@ -25,6 +28,19 @@ export default function App() {
   const withdrawMutation = useWithdraw();
   const cancelMutation = useCancel();
 
+  // One clock for the whole dashboard: stream cards recompute their accrual
+  // every second from start/end/cliff instead of waiting for the next poll.
+  const now = useNow(1000);
+
+  // Guard against pointing the app at the wrong chain (RPC or wallet).
+  const networkQuery = useQuery({
+    queryKey: ["network-check"],
+    queryFn: checkNetwork,
+    enabled: !!address,
+    refetchInterval: 60_000,
+    retry: false,
+  });
+
   const streams = streamsQuery.data ?? [];
   const streamError = streamsQuery.error
     ? streamsQuery.error instanceof Error
@@ -40,28 +56,10 @@ export default function App() {
     : null;
 
   /** Resolves `true` so the form resets, or `false` to keep the user's input. */
-  const handleCreate = async (
-    values: CreateStreamFormValues,
-  ): Promise<boolean> => {
+  const handleCreate = async (draft: CreateStreamDraft): Promise<boolean> => {
     if (!address) return false;
-    const startInSeconds =
-      values.startIn.trim() === "" ? 0 : Number(values.startIn);
     try {
-      await createMutation.mutateAsync({
-        sender: address,
-        receiver: values.receiver.trim(),
-        token: values.token.trim(),
-        amount: values.amount.trim(),
-        durationSeconds: Number(values.duration),
-        // The contract takes an absolute `start_time`, so the SDK gets the
-        // relative delay and anchors it when the transaction is built. Blank/0
-        // leaves it unset: the contract stamps the ledger time and the call
-        // stays the plain `create_stream`.
-        startDelaySeconds: startInSeconds > 0 ? startInSeconds : undefined,
-        // Empty cliff = no cliff, so the call stays the plain `create_stream`.
-        cliffSeconds:
-          values.cliff.trim() === "" ? undefined : Number(values.cliff),
-      });
+      await createMutation.mutateAsync({ sender: address, ...draft });
       return true;
     } catch {
       return false;
@@ -79,6 +77,9 @@ export default function App() {
       />
 
       <main>
+        {networkQuery.data?.message && (
+          <Banner variant="error">{networkQuery.data.message}</Banner>
+        )}
         {error && <Banner variant="error">{error}</Banner>}
         {streamError && <Banner variant="error">{streamError}</Banner>}
         {notice && <Banner variant="success">{notice}</Banner>}
@@ -87,8 +88,9 @@ export default function App() {
           <section className="hero">
             <h2>Stream salaries, unlocks, and grants — continuously.</h2>
             <p>
-              Connect your Freighter wallet to view your streams and withdraw
-              the amount that has vested so far.
+              Connect a Stellar wallet (Freighter, Albedo, xBull, Lobstr, Hana
+              and more) to view your streams and withdraw the amount that has
+              vested so far.
             </p>
           </section>
         )}
@@ -97,11 +99,13 @@ export default function App() {
           <>
             <CreateStreamForm
               creating={createMutation.isPending}
+              walletAddress={address}
               onSubmit={handleCreate}
             />
             <StreamList
               streams={streams}
               walletAddress={address}
+              now={now}
               loading={streamsQuery.isLoading}
               busyId={withdrawingId}
               cancellingId={cancellingId}

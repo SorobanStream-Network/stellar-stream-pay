@@ -54,6 +54,8 @@ export const STREAM_CORE_ERRORS: Readonly<Record<number, string>> = {
   18: "Invalid allocation — weights must be positive and sum to the full total.",
   19: "Too many receivers in one split stream (the limit is 32).",
   20: "Too many stream ids in one bump_many call (the limit is 32). Chunk the batch and retry.",
+  21: "That start time is in the past. Pick a time in the future (a few seconds of clock skew is tolerated).",
+  22: "The cliff cannot be longer than the stream's duration.",
 };
 
 /** Soroban host errors that have a stable, recognizable message fragment. */

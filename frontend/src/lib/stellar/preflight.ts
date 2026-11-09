@@ -27,11 +27,11 @@ import {
   xdr,
 } from "@stellar/stellar-sdk";
 import { Api } from "@stellar/stellar-sdk/rpc";
-import { getAddress, isAllowed, isConnected } from "@stellar/freighter-api";
 import { CONFIG } from "../../config";
 import type { CreateStreamParams } from "../../types";
 import { decodeSorobanError, PreflightError } from "./errors";
 import { rpcServer } from "./rpc";
+import { getWalletAddress } from "./wallet";
 
 let horizon: Horizon.Server | null = null;
 
@@ -64,35 +64,22 @@ export async function runPreflight(checks: PreflightCheck[]): Promise<void> {
 }
 
 /**
- * Freighter is installed, connected, and approved for this dapp. Unlike
- * `connectWallet` this never triggers a popup — the wallet was already
- * connected to reach this screen.
+ * A wallet is connected and (when `source` is given) still exposes that same
+ * account. Wallet-agnostic: Stellar Wallets Kit resolves whichever wallet the
+ * user picked, and this never opens a popup.
  */
-export async function assertFreighterReady(source?: string): Promise<string | null> {
+export async function assertWalletReady(source?: string): Promise<string | null> {
   try {
-    const connected = (await isConnected()) as {
-      isConnected?: boolean;
-      error?: unknown;
-    };
-    if (connected.error || !connected.isConnected) {
-      return "Freighter is not installed or not connected. Install / unlock Freighter and connect your wallet first.";
+    const address = await getWalletAddress();
+    if (!address) {
+      return "No wallet is connected. Click “Connect wallet” and approve access first.";
     }
-    const allowed = (await isAllowed()) as { isAllowed?: boolean; error?: unknown };
-    if (allowed.error || !allowed.isAllowed) {
-      return "Freighter access has not been granted for this app. Click “Connect Freighter” once to approve.";
-    }
-    if (source) {
-      const addr = (await getAddress()) as { address?: string; error?: unknown };
-      if (addr.error || !addr.address) {
-        return "Freighter could not provide the active account.";
-      }
-      if (addr.address !== source) {
-        return "The active Freighter account does not match the connected address. Switch accounts in Freighter and try again.";
-      }
+    if (source && address !== source) {
+      return "The active wallet account does not match the connected address. Switch accounts and try again.";
     }
     return null;
   } catch {
-    return "Could not reach the Freighter extension. Is it installed and unlocked?";
+    return "Could not reach your wallet. Is the extension installed and unlocked?";
   }
 }
 
@@ -270,7 +257,7 @@ export async function preflightCreateStream(
   params: CreateStreamParams,
 ): Promise<void> {
   await runPreflight([
-    () => assertFreighterReady(params.sender),
+    () => assertWalletReady(params.sender),
     () => assertAccountExists(params.sender),
     () => assertSufficientGas(params.sender),
     // The sender must be able to lock the full amount…
@@ -283,7 +270,7 @@ export async function preflightCreateStream(
 /** Full pre-flight for `withdraw`. Runs before the wallet dialog. */
 export async function preflightWithdraw(receiver: string): Promise<void> {
   await runPreflight([
-    () => assertFreighterReady(receiver),
+    () => assertWalletReady(receiver),
     () => assertAccountExists(receiver),
     () => assertSufficientGas(receiver),
   ]);
@@ -292,7 +279,7 @@ export async function preflightWithdraw(receiver: string): Promise<void> {
 /** Full pre-flight for `cancel`. Runs before the wallet dialog. */
 export async function preflightCancel(caller: string): Promise<void> {
   await runPreflight([
-    () => assertFreighterReady(caller),
+    () => assertWalletReady(caller),
     () => assertAccountExists(caller),
     () => assertSufficientGas(caller),
   ]);
